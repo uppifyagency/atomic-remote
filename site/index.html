@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>atomic-remote — command running Atomic sessions from Claude Code</title>
+<meta name="description" content="A Claude Code plugin that turns any Atomic (by Bastani) terminal session into a remotely-commandable agent: attributed replies, workflow-aware waits, heartbeat liveness. Zero dependencies, local-only.">
+<meta property="og:title" content="atomic-remote">
+<meta property="og:description" content="Command running Atomic sessions from Claude Code. Protocol v2: attributed replies, workflow-aware waits, heartbeat liveness.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚛️</text></svg>">
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #11151f; --panel-2: #151a26; --line: #1f2634;
+    --text: #d7dce6; --dim: #8b94a7; --faint: #5b6478;
+    --accent: #4ade80; --accent-dim: #22c55e33; --amber: #fbbf24; --red: #f87171;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  header { padding: 18px 0; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: #0b0e14ee; backdrop-filter: blur(8px); z-index: 10; }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; }
+  .brand { font-family: var(--mono); font-weight: 600; font-size: 15px; color: var(--text); }
+  .brand .dot { color: var(--accent); }
+  nav a { color: var(--dim); font-size: 14px; margin-left: 22px; }
+  nav a:hover { color: var(--text); text-decoration: none; }
+
+  .hero { padding: 88px 0 56px; }
+  .tag { font-family: var(--mono); font-size: 12.5px; color: var(--accent); border: 1px solid var(--accent-dim); background: #4ade8010; border-radius: 999px; padding: 4px 12px; display: inline-block; margin-bottom: 22px; }
+  h1 { font-size: clamp(30px, 5.2vw, 52px); line-height: 1.12; letter-spacing: -0.02em; font-weight: 700; }
+  h1 .hl { color: var(--accent); }
+  .lede { color: var(--dim); font-size: 18px; max-width: 640px; margin: 22px 0 30px; }
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn { font-family: var(--mono); font-size: 14px; padding: 11px 20px; border-radius: 8px; border: 1px solid var(--line); }
+  .btn.primary { background: var(--accent); color: #05240f; font-weight: 600; border-color: transparent; }
+  .btn.primary:hover { filter: brightness(1.1); text-decoration: none; }
+  .btn.ghost { color: var(--text); background: var(--panel); }
+  .btn.ghost:hover { border-color: var(--faint); text-decoration: none; }
+
+  .term { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin: 48px 0 0; overflow: hidden; box-shadow: 0 24px 60px #00000055; }
+  .term-bar { display: flex; gap: 7px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .term-bar span { width: 11px; height: 11px; border-radius: 50%; background: #2a3145; }
+  .term-bar span:first-child { background: #f8717155; }
+  .term-bar span:nth-child(2) { background: #fbbf2455; }
+  .term-bar span:nth-child(3) { background: #4ade8055; }
+  .term pre { padding: 20px 22px; font-family: var(--mono); font-size: 13.5px; line-height: 1.75; overflow-x: auto; color: var(--dim); }
+  .term .c { color: var(--faint); } .term .g { color: var(--accent); } .term .t { color: var(--text); } .term .a { color: var(--amber); }
+
+  section { padding: 72px 0 0; }
+  h2 { font-size: 26px; letter-spacing: -0.01em; margin-bottom: 8px; }
+  .sub { color: var(--dim); margin-bottom: 34px; max-width: 640px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+  .card h3 { font-size: 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 9px; }
+  .card h3 .ic { color: var(--accent); font-family: var(--mono); font-size: 14px; }
+  .card p { color: var(--dim); font-size: 14.5px; }
+  .card code { font-family: var(--mono); font-size: 12.5px; color: var(--text); background: var(--panel-2); padding: 1px 6px; border-radius: 5px; }
+
+  .steps { counter-reset: step; }
+  .step { display: flex; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--line); }
+  .step:last-child { border-bottom: none; }
+  .step .n { counter-increment: step; font-family: var(--mono); color: var(--accent); font-size: 14px; min-width: 28px; padding-top: 2px; }
+  .step .n::before { content: "0" counter(step); }
+  .step h3 { font-size: 16px; margin-bottom: 6px; }
+  .step p { color: var(--dim); font-size: 14.5px; }
+  pre.code { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; font-family: var(--mono); font-size: 13px; overflow-x: auto; margin-top: 10px; color: var(--text); }
+  pre.code .c { color: var(--faint); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .tablebox { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 6px 18px 10px; overflow-x: auto; }
+  th { text-align: left; color: var(--faint); font-weight: 500; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.06em; padding: 14px 14px 8px 0; border-bottom: 1px solid var(--line); }
+  td { padding: 11px 14px 11px 0; border-bottom: 1px solid var(--line); color: var(--dim); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td:first-child { font-family: var(--mono); color: var(--text); white-space: nowrap; }
+  .ok { color: var(--accent); } .warn { color: var(--amber); } .err { color: var(--red); }
+
+  .sec { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 10px; padding: 20px 22px; color: var(--dim); font-size: 14.5px; }
+  .sec strong { color: var(--text); }
+
+  footer { margin-top: 96px; padding: 36px 0 48px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13.5px; }
+  footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand">atomic-remote<span class="dot">_</span></div>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#protocol">Protocol v2</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/uppifyagency/atomic-remote">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <span class="tag">Claude Code plugin · protocol v2 · zero dependencies</span>
+    <h1>Command running <span class="hl">Atomic</span> sessions<br>from Claude Code.</h1>
+    <p class="lede">
+      Turn any Atomic (by Bastani) session in your terminal into a remotely-commandable agent:
+      send prompts, steer it mid-run, interrupt it, follow its workflows to completion —
+      and read back replies that are provably yours.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#install">Get started</a>
+      <a class="btn ghost" href="https://github.com/uppifyagency/atomic-remote">View source →</a>
+    </div>
+
+    <div class="term">
+      <div class="term-bar"><span></span><span></span><span></span></div>
+      <pre>
+<span class="c">$</span> <span class="t">atomic-ctl send auto "Run the tests and fix what fails" --wait</span>
+<span class="c">[turn_bound] id=c4896589a4d0</span>
+<span class="c">[accepted]   id=c4896589a4d0</span>
+<span class="c">[agent_start] → [agent_settled] owner=c4896589a4d0</span>
+<span class="g">All 47 tests passing. Fixed a race in api/client.ts:112 and a stale
+mock in auth.test.ts. Two commits on branch fix/test-suite.</span>
+<span class="c">$ echo $?</span>
+<span class="g">0</span>  <span class="c"># exit codes are the contract — 0 means: this reply is YOURS</span></pre>
+    </div>
+  </div>
+
+  <section id="how">
+    <h2>Claude Code plans. Atomic executes.</h2>
+    <p class="sub">
+      Claude Code is the brain: it designs, decomposes, decides. Atomic is the arm: multi-stage
+      workflows, browser verification, independent verifier panels. atomic-remote is the wire
+      between them — while you watch everything happen live in your terminal.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <h3><span class="ic">◈</span>File-based bridge</h3>
+        <p>An Atomic extension registers each session under <code>~/.atomic/agent/remote-bridge/</code>
+        with a command inbox and an event outbox. Local IPC by files: no ports, no daemons,
+        no network surface.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">◈</span>Official APIs only</h3>
+        <p>Injection via <code>pi.sendUserMessage</code> / <code>pi.sendMessage</code>; lifecycle from
+        documented events (<code>input</code>, <code>agent_settled</code>, <code>tool_execution_end</code>).
+        Nothing reverse-engineered, nothing that breaks on upgrade.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">◈</span>Four command modes</h3>
+        <p><code>prompt</code> starts a turn · <code>steer</code> redirects mid-run ·
+        <code>follow_up</code> queues for after · <code>interrupt</code> aborts and takes over.
+        Plus <code>status</code>, <code>abort</code>, live <code>follow</code>, durable <code>tail</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="protocol">
+    <h2>Protocol v2 — replies you can trust</h2>
+    <p class="sub">
+      v2 shipped from an adversarial multi-agent design review: 30 proposals, each verified
+      against Atomic's official docs, distilled to five guarantees.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <h3><span class="ic">01</span>Attributed replies</h3>
+        <p>Commands bind to their turn via the documented <code>input</code> event; every record
+        carries an <code>owner</code> id. <code>--wait</code> concludes on <code>agent_settled</code> for
+        <em>your</em> command — or refuses (exit 6) when concurrent typing makes attribution
+        unsafe. It never guesses.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">02</span>Workflow-aware waits</h3>
+        <p>If your command launches an Atomic workflow, <code>--wait</code> follows the run to its
+        terminal lifecycle notice. "Workflow started" is never presented as the result.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">03</span>Heartbeat liveness</h3>
+        <p>Sessions are <span class="ok">live</span> / <span class="warn">stale</span> /
+        <span class="err">closed</span> by a 5-second beacon — not by a transient engine pid that
+        Atomic legitimately replaces. Delivery to a dead bridge is refused up front.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">04</span>Nothing deleted implicitly</h3>
+        <p><code>list</code> is read-only. History survives session shutdown. Cleanup happens only
+        via explicit <code>prune</code>, closed sessions only, with symlink-escape guards.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">05</span>Fail-closed inbox</h3>
+        <p>Schema-validated commands, <code>O_NOFOLLOW</code> + regular-file + 64&nbsp;KiB checks,
+        serial processing, at-least-once semantics with restart recovery. Every command gets an
+        ack — malformed ones included.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">→</span>Exit codes are the contract</h3>
+        <div class="tablebox" style="margin-top:10px; padding: 0 12px;">
+          <table>
+            <tr><td>0</td><td>stdout is the attributed reply</td></tr>
+            <tr><td>2</td><td>timeout — still working, check later</td></tr>
+            <tr><td>6</td><td>attribution uncertain — report nothing</td></tr>
+            <tr><td>7</td><td>workflow detached — run id printed</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install in two minutes</h2>
+    <p class="sub">Two sides: the plugin in Claude Code, the bridge extension in Atomic.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="n"></div>
+        <div style="flex:1">
+          <h3>Add the plugin to Claude Code</h3>
+          <pre class="code">claude plugin marketplace add uppifyagency/atomic-remote
+claude plugin install atomic-remote@atomic-remote</pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n"></div>
+        <div style="flex:1">
+          <h3>Install the bridge into Atomic</h3>
+          <p>From any Claude Code session:</p>
+          <pre class="code">/atomic-remote:setup</pre>
+          <p style="margin-top:8px">Then, <strong style="color:var(--text)">inside the running Atomic session</strong>: <code style="font-family:var(--mono); font-size:13px">/reload</code> — you'll see <span style="color:var(--accent); font-family:var(--mono); font-size:13px">atomic-remote bridge v0.2.0 active</span>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n"></div>
+        <div style="flex:1">
+          <h3>Command it</h3>
+          <pre class="code">/atomic-remote:list
+/atomic-remote:send auto "Build a snake game with your workflow" --wait
+/atomic-remote:status my-project
+/atomic-remote:follow my-project</pre>
+          <p style="margin-top:8px">Or just ask Claude in natural language — the bundled skill teaches it the whole flow, exit codes included.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec">
+      <strong>Security model.</strong> Anything that can write into the bridge inbox commands your
+      agent with your full user permissions. Directories are created <code style="font-family:var(--mono)">0700</code>,
+      files <code style="font-family:var(--mono)">0600</code>, transport is strictly local files — no network surface.
+      Do not widen the permissions; do not expose the inbox over a network.
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>MIT © 2026 Vlad Vrinceanu</div>
+    <div>
+      <a href="https://github.com/uppifyagency/atomic-remote">GitHub</a> ·
+      <a href="https://github.com/uppifyagency/atomic-remote/blob/main/ROADMAP.md">Design history</a> ·
+      <a href="https://github.com/bastani-inc/atomic">Atomic by Bastani</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

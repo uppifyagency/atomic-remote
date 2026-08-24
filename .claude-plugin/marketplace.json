@@ -1,0 +1,11 @@
+{
+  "name": "atomic-remote",
+  "owner": { "name": "Vlad Vrinceanu" },
+  "plugins": [
+    {
+      "name": "atomic-remote",
+      "source": "./",
+      "description": "Command a running Atomic (by Bastani) session from Claude Code."
+    }
+  ]
+}
