@@ -16,11 +16,13 @@ Two control planes. Pick by situation:
 
 1. **Discover**: `node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" list`
    States: `live` (commandable), `stale` (bridge v1 or hung — needs `/reload` in Atomic),
-   `closed` (history only). Targets: name (auto = cwd basename, or `/remote-name`),
-   session-id prefix, cwd, or `auto` when exactly one live session exists.
+   `closed` (history only). Live sessions also show `busy` or `idle` (from the 5 s
+   heartbeat). Targets: name (auto = cwd basename, or `/remote-name`), session-id prefix,
+   cwd, or `auto` when exactly one live session exists.
 
 2. **Check before commanding** (imperative rule): before a `send --wait`, run
-   `status <target>`. If `idle: false`, or the later `accepted` record reports
+   `status <target>` (`list` already hints busy/idle; `status` is the authoritative
+   bridge-side answer). If `idle: false`, or the later `accepted` record reports
    `contended: true`, do NOT trust attribution blindly — prefer `follow` to watch,
    or `--mode steer` to cooperate with the running work instead of racing it.
 

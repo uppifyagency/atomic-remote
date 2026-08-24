@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 67 tests
+  covering the controller end-to-end (target resolution, exit-code contract,
+  wait-loop state machine, outbox rotation, reattach, prune safety), the bridge
+  extension imported as a real module (validation matrix, serial ingestion,
+  crash recovery, attribution, workflow mirroring, shutdown semantics), rpc-run
+  against a scripted fake `atomic`, and repo consistency (version sync,
+  documented flags/exit codes must exist).
+- **`list` shows busy/idle** for live sessions, from the heartbeat the bridge
+  already writes; `list --json` carries a `busy` field. Answering "is it safe
+  to send?" no longer requires a `status` round-trip.
+
+### Fixed
+- **`prune` now ages closed sessions by `closedAt`, not `startedAt`.** A
+  long-lived session closed an hour ago no longer loses its entire history to
+  a default 7-day prune just because it *started* more than 7 days ago.
+
 ## [0.2.1] — 2026-08-24
 
 Hardening release: every fix below comes from a fresh 8-finder adversarial code

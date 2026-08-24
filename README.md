@@ -138,6 +138,18 @@ those permissions and do not expose the inbox over the network without authentic
 The outbox contains assistant output (i.e., your project's code) and is `0600` for the
 same reason.
 
+## Tests
+
+```bash
+node --test 'test/*.test.mjs'    # Node >= 22 (same floor as Atomic itself)
+```
+
+Dependency-free `node:test` suites that exercise the real artifacts: the controller
+binary end-to-end against fake bridge session dirs, the bridge extension imported
+directly (Node 22 type stripping) and driven through a fake extension API, `rpc-run`
+against a scripted fake `atomic` RPC process, and repo consistency checks
+(version sync, documented flags and exit codes).
+
 ## Requirements
 
 - [Atomic by Bastani](https://github.com/bastani-inc/atomic) ≥ 0.9 (Node 22 runtime)
