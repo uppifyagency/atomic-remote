@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-label="atomic-remote — command running Atomic sessions from Claude Code">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0d13"/>
+      <stop offset="0.55" stop-color="#0c1018"/>
+      <stop offset="1" stop-color="#0a1210"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.28" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#4ade80" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#4ade80" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#4ade80" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.85" cy="0.5" r="0.45">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wire" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#4ade80"/>
+    </linearGradient>
+    <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M 36 0 L 0 0 0 36" fill="none" stroke="#1d2634" stroke-width="0.6" opacity="0.55"/>
+    </pattern>
+    <clipPath id="frame"><rect width="1200" height="420" rx="16"/></clipPath>
+    <style>
+      .mono { font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace; }
+      .cursor { animation: blink 1.1s steps(1) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+      .pulse { animation: pulse 3.2s ease-in-out infinite; transform-origin: 340px 175px; }
+      @keyframes pulse { 0%,100% { opacity: .75 } 50% { opacity: 1 } }
+      .dashy { stroke-dasharray: 5 7; animation: dash 1.6s linear infinite; }
+      @keyframes dash { to { stroke-dashoffset: -12; } }
+      .dashyback { stroke-dasharray: 5 7; animation: dashback 1.6s linear infinite; }
+      @keyframes dashback { to { stroke-dashoffset: 12; } }
+      .fadein { animation: fadein 1s ease-out both; }
+      @keyframes fadein { from { opacity: 0 } to { opacity: 1 } }
+    </style>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="420" fill="url(#bg)"/>
+    <rect width="1200" height="420" fill="url(#grid)"/>
+    <rect width="1200" height="420" fill="url(#glow)" class="pulse"/>
+    <rect width="1200" height="420" fill="url(#glow2)"/>
+
+    <!-- ============ LEFT: title block ============ -->
+    <g class="fadein">
+      <!-- badge -->
+      <rect x="72" y="86" width="318" height="30" rx="15" fill="#4ade8012" stroke="#4ade8040"/>
+      <text x="88" y="106" class="mono" font-size="13" fill="#4ade80">protocol v2 · zero deps · local-only</text>
+
+      <!-- title -->
+      <text x="70" y="182" class="mono" font-size="58" font-weight="700" fill="#e8edf6" letter-spacing="-1">atomic-remote</text>
+      <text x="530" y="182" class="mono cursor" font-size="58" font-weight="700" fill="#4ade80">_</text>
+
+      <!-- tagline -->
+      <text x="72" y="224" font-family="-apple-system, 'Segoe UI', Inter, Roboto, sans-serif" font-size="21" fill="#9aa4b8">Command running <tspan fill="#e8edf6" font-weight="600">Atomic</tspan> sessions from <tspan fill="#e8edf6" font-weight="600">Claude Code</tspan>.</text>
+      <text x="72" y="254" font-family="-apple-system, 'Segoe UI', Inter, Roboto, sans-serif" font-size="15.5" fill="#6b7590">Send prompts · steer mid-run · interrupt · follow workflows · attributed replies</text>
+    </g>
+
+    <!-- terminal line -->
+    <g class="mono fadein" font-size="15">
+      <rect x="72" y="292" width="560" height="76" rx="10" fill="#0d1119" stroke="#1f2938"/>
+      <text x="92" y="322" fill="#5b6478">$ <tspan fill="#d7dce6">atomic-ctl send auto "fix the tests" --wait</tspan></text>
+      <text x="92" y="350" fill="#4ade80">✓ 47/47 passing <tspan fill="#5b6478">· exit 0 — this reply is provably yours</tspan></text>
+    </g>
+
+    <!-- ============ RIGHT: bridge diagram ============ -->
+    <g class="fadein">
+      <!-- Claude Code node -->
+      <rect x="742" y="96" width="180" height="64" rx="12" fill="#0e1524" stroke="#38bdf855" stroke-width="1.2"/>
+      <circle cx="766" cy="128" r="4" fill="#38bdf8"/>
+      <text x="782" y="124" class="mono" font-size="14" fill="#cfe7f8" font-weight="600">CLAUDE CODE</text>
+      <text x="782" y="142" class="mono" font-size="11" fill="#5f7f95">plans · decides</text>
+
+      <!-- Atomic node -->
+      <rect x="982" y="256" width="150" height="64" rx="12" fill="#0e1a14" stroke="#4ade8055" stroke-width="1.2"/>
+      <circle cx="1006" cy="288" r="4" fill="#4ade80"/>
+      <text x="1022" y="284" class="mono" font-size="14" fill="#d3f2df" font-weight="600">ATOMIC</text>
+      <text x="1022" y="302" class="mono" font-size="11" fill="#5f9573">executes</text>
+
+      <!-- bridge label -->
+      <rect x="858" y="196" width="128" height="26" rx="13" fill="#10151f" stroke="#28334a"/>
+      <text x="922" y="213" text-anchor="middle" class="mono" font-size="11.5" fill="#8b94a7">file bridge · 0700</text>
+
+      <!-- wires -->
+      <path id="wireDown" d="M 832 160 C 832 224, 940 224, 1000 256" fill="none" stroke="url(#wire)" stroke-width="1.6" class="dashy" opacity="0.85"/>
+      <path id="wireUp" d="M 1057 256 C 1080 200, 960 150, 922 128" fill="none" stroke="#2f3b52" stroke-width="1.6" class="dashyback" opacity="0.9"/>
+
+      <!-- packets -->
+      <circle r="4.5" fill="#38bdf8">
+        <animateMotion dur="2.6s" repeatCount="indefinite" path="M 832 160 C 832 224, 940 224, 1000 256"/>
+      </circle>
+      <circle r="4.5" fill="#4ade80">
+        <animateMotion dur="2.6s" begin="1.3s" repeatCount="indefinite" path="M 1057 256 C 1080 200, 960 150, 922 128"/>
+      </circle>
+
+      <!-- wire captions -->
+      <text x="806" y="248" class="mono" font-size="10.5" fill="#38bdf8" opacity="0.8">commands ↓</text>
+      <text x="1052" y="186" class="mono" font-size="10.5" fill="#4ade80" opacity="0.8">↑ attributed replies</text>
+
+      <!-- your terminal, watching -->
+      <text x="922" y="356" text-anchor="middle" class="mono" font-size="11.5" fill="#5b6478">— you watch it all live in your terminal —</text>
+    </g>
+
+    <!-- frame stroke -->
+    <rect x="0.5" y="0.5" width="1199" height="419" rx="16" fill="none" stroke="#1f2836"/>
+  </g>
+</svg>

@@ -1,3 +1,21 @@
+<div align="center">
+
+<img src="assets/hero.svg" alt="atomic-remote — command running Atomic sessions from Claude Code" width="100%">
+
+<br><br>
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-38bdf8?style=flat-square)](CHANGELOG.md)
+[![Protocol](https://img.shields.io/badge/protocol-v2-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v2-guarantees)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-4ade80?style=flat-square)](#)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
+
+**[Website](https://atomic-remote.vercel.app)** · **[Install](#install)** · **[Protocol v2](#what-protocol-v2-guarantees)** · **[Design history](ROADMAP.md)**
+
+</div>
+
+---
+
 # atomic-remote
 
 **Command running [Atomic](https://github.com/bastani-inc/atomic) sessions from Claude Code.**
