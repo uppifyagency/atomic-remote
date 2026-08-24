@@ -176,7 +176,17 @@ export function readOutbox(sessionDir) {
 		.map((line) => JSON.parse(line));
 }
 
-export async function untilOutbox(sessionDir, predicate, { timeoutMs = 5000 } = {}) {
+// Default derived from the bridge's INBOX_SAFETY_SCAN_MS (10 s) plus margin:
+// when fs.watch misses a rename under load, the safety scan is the real
+// worst-case delivery latency, and the wait must outlive it.
+const BRIDGE_SAFETY_SCAN_MS = Number(
+	fs
+		.readFileSync(fileURLToPath(new URL("../atomic-extension/atomic-remote-bridge.ts", import.meta.url)), "utf8")
+		.match(/INBOX_SAFETY_SCAN_MS = ([\d_]+)/)[1]
+		.replaceAll("_", ""),
+);
+
+export async function untilOutbox(sessionDir, predicate, { timeoutMs = BRIDGE_SAFETY_SCAN_MS + 5000 } = {}) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const records = readOutbox(sessionDir);

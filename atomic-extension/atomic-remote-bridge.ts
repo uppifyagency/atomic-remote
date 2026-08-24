@@ -20,6 +20,8 @@
  *     (rename to .processing before injection; leftovers surface as errors)
  *   - agent records carry an `owner` command id when attribution is known
  *   - `agent_settled` is the terminal record for a turn, not `agent_end`
+ *   - an interrupt preempts a bound owner: it claims the next turn, and the
+ *     preempted command's settle carries `aborted: true` under its own id
  *   - the bridge NEVER deletes its own directory; on shutdown it marks
  *     meta.status = "closed", clears only inbox/, and emits bridge_closed
  *
@@ -158,6 +160,8 @@ export default function (pi: ExtensionAPI) {
 	const pendingBindings = new Map<string, string>(); // normalized text -> command id
 	let interruptPending: string | null = null;
 	let activeOwner: string | null = null;
+	let preemptedOwner: string | null = null; // owner whose turn an interrupt aborted
+	let endSeenSinceStart = false;
 	let foreignSinceLastSettle = false;
 	let lastTextForOwner: string | null = null;
 
@@ -519,6 +523,8 @@ export default function (pi: ExtensionAPI) {
 		pendingBindings.clear();
 		interruptPending = null;
 		activeOwner = null;
+		preemptedOwner = null;
+		endSeenSinceStart = false;
 		foreignSinceLastSettle = false;
 		lastTextForOwner = null;
 		knownRuns.clear();
@@ -630,7 +636,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		agentRunning = true;
-		if (interruptPending !== null && activeOwner === null) {
+		endSeenSinceStart = false;
+		if (interruptPending !== null) {
+			// deliverAs "interrupt" aborts the active turn and starts this one, so the
+			// interrupt claims the turn even over a still-bound owner (preemption).
+			// The preempted owner is kept: its aborted run may still settle late.
+			if (activeOwner !== null) preemptedOwner = activeOwner;
 			activeOwner = interruptPending;
 			interruptPending = null;
 			emit({ type: "turn_bound", id: activeOwner, via: "interrupt" });
@@ -641,6 +652,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (event) => {
+		endSeenSinceStart = true;
 		const messages = ((event as { messages?: MessageLike[] }).messages ?? []) as MessageLike[];
 		const text = extractAssistantText(messages);
 		if (text !== null) lastTextForOwner = text;
@@ -648,6 +660,21 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		if (!endSeenSinceStart && preemptedOwner !== null) {
+			// The preempted run settling late, after the interrupt's turn already
+			// started (live-observed ordering). Attribute it to the old owner as
+			// aborted and leave the running interrupt turn's state untouched.
+			emit({
+				type: "agent_settled",
+				owner: preemptedOwner,
+				aborted: true,
+				foreignInputSeen: foreignSinceLastSettle,
+				text: lastTextForOwner,
+			});
+			preemptedOwner = null;
+			lastTextForOwner = null;
+			return;
+		}
 		agentRunning = false;
 		writeHeartbeat();
 		scanEntriesForWorkflows(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
@@ -664,8 +691,10 @@ export default function (pi: ExtensionAPI) {
 		ensureWorkflowTimer(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
 		activeOwner = null;
 		// An interrupt binding that never claimed a turn is stale once the session
-		// settles; leaving it set would misattribute the next unrelated turn.
+		// settles; leaving it set would misattribute the next unrelated turn. The
+		// same goes for a preempted owner whose aborted settle never arrived.
 		interruptPending = null;
+		preemptedOwner = null;
 		foreignSinceLastSettle = false;
 		lastTextForOwner = null;
 	});

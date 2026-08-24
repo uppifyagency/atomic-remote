@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 69 tests
+- **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 72 tests
   covering the controller end-to-end (target resolution, exit-code contract,
   wait-loop state machine, outbox rotation, reattach, prune safety), the bridge
   extension imported as a real module (validation matrix, serial ingestion,
@@ -25,6 +25,17 @@
   the explicit `prune` command.
 
 ### Fixed
+- **Interrupt replies are now attributed** (reproduced live, twice, on
+  atomic 0.9.13). On a busy session, the interrupt's new turn used to start
+  while the old command was still bound: the aborted run's late settle
+  consumed the old owner with `text: null`, destroyed the interrupt binding,
+  and the actual reply landed `owner: null` — so `send --mode interrupt
+  --wait` timed out (exit 2) while the reply sat ownerless in the outbox.
+  The bridge now treats an interrupt as preemption: the interrupt claims the
+  next turn even over a bound owner (`turn_bound` with `via: "interrupt"`),
+  and the preempted command's settle is emitted with `aborted: true` under
+  its own id. The controller reports an owned aborted settle as exit 5
+  ("aborted before completing") instead of a silent empty success.
 - **`prune` now ages closed sessions by `closedAt`, not `startedAt`.** A
   long-lived session closed an hour ago no longer loses its entire history to
   a default 7-day prune just because it *started* more than 7 days ago.

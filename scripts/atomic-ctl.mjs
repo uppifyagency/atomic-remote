@@ -319,6 +319,9 @@ async function waitForOutcome(target, payload, flags) {
 					const weaklyOwned =
 						record.owner === null && !bound && !isPrompt && !foreignSeen && !record.foreignInputSeen;
 					if (!owned && !weaklyOwned) break;
+					if (owned && record.aborted) {
+						fail("The turn for this command was aborted before completing (interrupted).", 5);
+					}
 					if (owned && record.foreignInputSeen && isPrompt && !flags.acceptPartial) {
 						fail(
 							"Attribution uncertain: the user typed into the Atomic session during your turn.\nInspect manually: tail " +
