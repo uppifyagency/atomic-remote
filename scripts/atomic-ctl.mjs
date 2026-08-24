@@ -51,12 +51,12 @@ function fail(message, code = 1) {
 
 // --- session registry (read-only: list NEVER deletes) ----------------------
 
-function heartbeatState(dir) {
+function readHeartbeat(dir) {
 	try {
 		const hb = JSON.parse(fs.readFileSync(path.join(dir, "heartbeat.json"), "utf8"));
-		return Date.now() - Number(hb.ts) < HEARTBEAT_STALE_MS ? "live" : "stale";
+		return { state: Date.now() - Number(hb.ts) < HEARTBEAT_STALE_MS ? "live" : "stale", busy: hb.busy === true };
 	} catch {
-		return "stale";
+		return { state: "stale", busy: null };
 	}
 }
 
@@ -71,8 +71,8 @@ function listSessions() {
 		} catch {
 			continue;
 		}
-		const state = meta.status === "closed" ? "closed" : heartbeatState(dir);
-		sessions.push({ ...meta, dir, state });
+		const hb = meta.status === "closed" ? { state: "closed", busy: null } : readHeartbeat(dir);
+		sessions.push({ ...meta, dir, state: hb.state, busy: hb.state === "live" ? hb.busy : null });
 	}
 	return sessions.sort((a, b) => String(a.startedAt ?? "").localeCompare(String(b.startedAt ?? "")));
 }
@@ -81,7 +81,7 @@ function formatSessions(sessions) {
 	return sessions
 		.map(
 			(s) =>
-				`  ${String(s.id).slice(0, 12).padEnd(13)} ${s.state.padEnd(7)} name=${s.name ?? "-"}  cwd=${s.cwd}  proto=${s.protocol ?? 1}  started=${s.startedAt ?? "?"}`,
+				`  ${String(s.id).slice(0, 12).padEnd(13)} ${s.state.padEnd(7)} ${(s.state === "live" ? (s.busy ? "busy" : "idle") : "-").padEnd(5)} name=${s.name ?? "-"}  cwd=${s.cwd}  proto=${s.protocol ?? 1}  started=${s.startedAt ?? "?"}`,
 		)
 		.join("\n");
 }
@@ -218,7 +218,7 @@ function writeCommand(target, payload) {
 			5,
 		);
 	}
-	if (heartbeatState(target.dir) !== "live") {
+	if (readHeartbeat(target.dir).state !== "live") {
 		fail(`Session ${target.id} stopped responding (stale heartbeat) — command not delivered.`, 3);
 	}
 	const inbox = path.join(target.dir, "inbox");
@@ -564,8 +564,9 @@ async function main() {
 			let removed = 0;
 			for (const session of listSessions()) {
 				if (session.state !== "closed") continue;
-				const startedAt = Date.parse(String(session.startedAt ?? "")) || 0;
-				if (startedAt > cutoff) continue;
+				// Age from closedAt: a long-lived session closed an hour ago is not "old".
+				const closedAt = Date.parse(String(session.closedAt ?? session.startedAt ?? "")) || 0;
+				if (closedAt > cutoff) continue;
 				const real = fs.realpathSync(session.dir);
 				if (path.relative(realRoot, real).startsWith("..")) continue; // symlink escape guard
 				fs.rmSync(session.dir, { recursive: true, force: true });
