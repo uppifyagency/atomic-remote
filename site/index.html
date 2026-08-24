@@ -145,9 +145,10 @@
   .sec-note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 12px; padding: 22px 24px; color: var(--dim); font-size: 14.5px; max-width: 820px; }
   .sec-note strong { color: var(--text); }
 
-  /* reveal on scroll */
-  .rv { opacity: 0; transform: translateY(18px); transition: opacity .6s ease, transform .6s ease; }
-  .rv.in { opacity: 1; transform: none; }
+  /* reveal on scroll — hidden state only when JS is running (progressive enhancement) */
+  html.js .rv { opacity: 0; transform: translateY(18px); transition: opacity .6s ease, transform .6s ease; }
+  html.js .rv.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) { html.js .rv { opacity: 1; transform: none; transition: none; } }
 
   footer { margin-top: 120px; padding: 40px 0 56px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13.5px; }
   footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 14px; }
@@ -463,6 +464,7 @@ claude plugin install \
   runScenario();
 
   // --- reveal on scroll ---
+  document.documentElement.classList.add('js');
   const io = new IntersectionObserver((entries)=>{
     for (const e of entries) if (e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
   }, { threshold: 0.12 });
