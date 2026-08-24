@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.2.1] — 2026-08-24
+
+Hardening release: every fix below comes from a fresh 8-finder adversarial code
+review of protocol v2 (18 verified findings), each verified against a live session.
+
+### Fixed
+- **Bridge: per-session state is now reset on `session_start`.** After `/new`,
+  `/resume`, or `/fork` in the same engine process, stale attribution bindings,
+  workflow runs, and the entry cursor no longer leak into the new session.
+- **Bridge: user input no longer erases a bound owner.** If the user types into
+  the session mid-turn, the settle keeps its `owner` and carries
+  `foreignInputSeen: true`; the controller now honors the documented exit 6
+  (attribution uncertain) instead of silently timing out (exit 2) and dropping
+  the reply. `--accept-partial` still opts into the contaminated reply.
+- **Bridge: stale interrupt bindings are cleared on settle** — a pending
+  interrupt binding can no longer claim a later, unrelated turn.
+- **Bridge: automatic GC of closed sessions removed.** "Nothing is deleted
+  implicitly" is now literally true; cleanup happens only via explicit `prune`.
+- **Bridge: restart-recovery error records now carry the real command id**
+  (the filename pattern was captured wrong, so recovery errors never correlated).
+- **Outbox rotation no longer loses records**: the controller drains the tail of
+  the rotated file (same inode) before switching to the fresh one.
+- **Controller: `tail` and `follow` now work on stale/closed sessions**, as the
+  docs always claimed — history really does survive shutdown.
+- **Controller: reattach after `/reload` no longer swallows records** (an
+  `agent_settled` arriving in the reattach window was silently discarded).
+- **Controller: a target that matches nothing exits 4, not 3** — a typo no
+  longer tells agents to reinstall the bridge.
+- **Controller: `follow` is bounded by default (30 s)**, matching its docs;
+  `--for 0` streams forever. Explicit `--timeout`/`--idle-timeout` are no longer
+  clobbered by `ping`/`status`/`abort` defaults.
+- **Controller: outbox dedupe key includes `runId`/`kind`** — two workflow
+  lifecycle records in the same millisecond no longer collapse into one.
+- **rpc-run: correct exit codes** — timeout-aborted runs exit 2 (not 0), a
+  failed RPC `response` exits 1 immediately (instead of hanging), and a
+  non-numeric `--timeout` is a usage error.
+- **Landing page**: the hero terminal now ships a static transcript (visible
+  without JavaScript) and respects `prefers-reduced-motion` (no infinite
+  typewriter/blink for users who asked for less motion).
+
+### Changed
+- Workflow lifecycle inference is guarded (entries must mention `workflow`) and
+  documented as best-effort; false negatives degrade to exit 7 at timeout.
+- Bridge inbox safety scan relaxed from 1 s to 10 s (`fs.watch` remains the
+  primary trigger); outbox rotation check no longer stats the file per record.
+
 ## [0.2.0] — 2026-08-24
 
 Protocol v2. Result of an adversarial multi-agent design review (30 proposals,

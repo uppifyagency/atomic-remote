@@ -3,8 +3,8 @@ description: Stream live bridge events from a running Atomic session (what it's 
 argument-hint: [target|auto] [seconds]
 ---
 
-Stream the Atomic session's outbox with the Bash tool (bounded — default 30 seconds unless
-the user asked for longer):
+Stream the Atomic session's outbox with the Bash tool (bounded — 30 seconds by default;
+pass `--for <seconds>` for longer, `--for 0` streams forever):
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" follow <target-or-auto> --for <seconds>

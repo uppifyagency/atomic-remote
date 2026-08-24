@@ -148,7 +148,11 @@
   /* reveal on scroll — hidden state only when JS is running (progressive enhancement) */
   html.js .rv { opacity: 0; transform: translateY(18px); transition: opacity .6s ease, transform .6s ease; }
   html.js .rv.in { opacity: 1; transform: none; }
-  @media (prefers-reduced-motion: reduce) { html.js .rv { opacity: 1; transform: none; transition: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    html.js .rv { opacity: 1; transform: none; transition: none; }
+    .brand .dot, .type-cursor { animation: none; }
+    * { transition-duration: 0.01ms !important; }
+  }
 
   footer { margin-top: 120px; padding: 40px 0 56px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13.5px; }
   footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 14px; }
@@ -191,8 +195,14 @@
 
     <div class="term">
       <div class="term-bar"><i></i><i></i><i></i><span class="title">claude-code — commanding atomic via the bridge</span></div>
-      <pre id="demo"><span class="c">$</span> <span class="t" id="typed"></span><span class="type-cursor"></span>
-<span id="demo-out"></span></pre>
+      <!-- Static transcript = the no-JS / reduced-motion fallback; the typewriter replaces it. -->
+      <pre id="demo"><span class="c">$</span> <span class="t" id="typed">atomic-ctl send auto "Run the tests and fix what fails" --wait</span><span class="type-cursor"></span>
+<span id="demo-out"><span class="c">[turn_bound] id=c4896589a4d0 · [accepted] · [agent_start]</span>
+<span class="c">[agent_settled] owner=c4896589a4d0</span>
+<span class="g">All 47 tests passing. Fixed a race in api/client.ts:112 and a</span>
+<span class="g">stale mock in auth.test.ts. Two commits on fix/test-suite.</span>
+<span class="c">$ echo $?  →  </span><span class="g">0   # this reply is provably yours</span>
+</span></pre>
     </div>
 
     <!-- flow strip -->
@@ -339,8 +349,8 @@
         <tr><th style="width:110px">Exit code</th><th>Meaning</th><th>What your automation should do</th></tr>
         <tr><td class="code"><span class="pill ok">0</span></td><td>stdout is the attributed reply</td><td>Trust it — it's provably yours</td></tr>
         <tr><td class="code"><span class="pill warn">2</span></td><td>Idle/absolute timeout</td><td>Check later with <span class="inline-code">tail</span> — don't resend</td></tr>
-        <tr><td class="code"><span class="pill warn">3</span></td><td>No live session / stale heartbeat</td><td>Reload the bridge in Atomic</td></tr>
-        <tr><td class="code"><span class="pill warn">4</span></td><td>Ambiguous target</td><td>Pick from the printed candidates</td></tr>
+        <tr><td class="code"><span class="pill warn">3</span></td><td>No session recorded / stale heartbeat</td><td>Reload the bridge in Atomic</td></tr>
+        <tr><td class="code"><span class="pill warn">4</span></td><td>Target not found or ambiguous</td><td>Fix the target; pick from the printed candidates</td></tr>
         <tr><td class="code"><span class="pill err">5</span></td><td>Bridge or run error (incl. failed workflow)</td><td>Report verbatim</td></tr>
         <tr><td class="code"><span class="pill err">6</span></td><td>Attribution uncertain — concurrent user input</td><td>Report <em>nothing</em> as the reply</td></tr>
         <tr><td class="code"><span class="pill warn">7</span></td><td>Async work detached (run id printed)</td><td>Track the workflow, don't fake a result</td></tr>
@@ -369,7 +379,7 @@ claude plugin install \
         <pre class="code">/atomic-remote:setup
 <span class="c"># inside the Atomic session:</span>
 /reload
-<span class="c"># → atomic-remote bridge v0.2.0 active</span></pre>
+<span class="c"># → atomic-remote bridge v0.2.1 active</span></pre>
       </div>
       <div class="step rv">
         <span class="n">STEP 03</span>
@@ -438,7 +448,7 @@ claude plugin install \
         ['t', '{'],
         ['t', '  "idle": false, "busy": true,'],
         ['t', '  "pendingWorkflows": ["8f31ac02…"],'],
-        ['t', '  "protocol": 2, "bridgeVersion": "0.2.0"'],
+        ['t', '  "protocol": 2, "bridgeVersion": "0.2.1"'],
         ['t', '}'],
         ['c', '# busy → steer, don\'t race it']
       ]
@@ -461,7 +471,8 @@ claude plugin install \
     await sleep(3400);
     runScenario();
   }
-  runScenario();
+  // Reduced motion: keep the static transcript instead of an infinite typewriter loop.
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) { si = 1; runScenario(); }
 
   // --- reveal on scroll ---
   document.documentElement.classList.add('js');

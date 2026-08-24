@@ -18,8 +18,9 @@
  * "auto" (allowed only when exactly one live session exists).
  *
  * Exit codes:
- *   0 completed   2 idle/absolute timeout   3 no live session   4 ambiguous target
- *   5 bridge or run error                   6 attribution uncertain (concurrent user input)
+ *   0 completed   2 idle/absolute timeout   3 no session recorded / delivery refused
+ *   4 target not found or ambiguous        5 bridge or run error
+ *   6 attribution uncertain (concurrent user input)
  *   7 detached async work still running (workflow run id printed)
  *   1 usage error
  */
@@ -34,6 +35,9 @@ const HEARTBEAT_STALE_MS = 20_000;
 const DEFAULT_IDLE_TIMEOUT_S = 120;
 const POLL_MS = 250;
 const PRUNE_DEFAULT_DAYS = 7;
+const REATTACH_WINDOW_MS = 20_000; // grace for bridge_ready after bridge_closed (/reload, /new)
+const DEFAULT_FOLLOW_S = 30; // follow is bounded by default; --for 0 streams forever
+const QUICK_TIMEOUT_S = 10; // ping/status round-trips
 
 const agentDir = process.env.ATOMIC_CODING_AGENT_DIR ?? path.join(os.homedir(), ".atomic", "agent");
 const bridgeRoot = path.join(agentDir, "remote-bridge");
@@ -82,10 +86,14 @@ function formatSessions(sessions) {
 		.join("\n");
 }
 
-function resolveTarget(token) {
+// anyState: read-only commands (tail/follow) may target stale/closed sessions —
+// history survives shutdown and must stay reachable. Delivery commands stay live-only.
+function resolveTarget(token, { anyState = false } = {}) {
 	const all = listSessions();
 	const live = all.filter((s) => s.state === "live");
-	if (live.length === 0) {
+	const pool = anyState ? all : live;
+	if (pool.length === 0) {
+		if (anyState) fail("No Atomic bridge sessions recorded.", 3);
 		const hint = all.some((s) => s.state === "stale")
 			? "Sessions exist but their heartbeat is stale — the bridge may be v1 (rerun setup + /reload in Atomic) or the session hung."
 			: "Install the bridge (/atomic-remote:setup), then run /reload inside the Atomic session.";
@@ -93,7 +101,8 @@ function resolveTarget(token) {
 	}
 	if (!token || token === "auto") {
 		if (live.length === 1) return live[0];
-		fail(`Multiple live sessions — specify a target:\n${formatSessions(live)}`, 4);
+		if (anyState && live.length === 0 && pool.length === 1) return pool[0];
+		fail(`Multiple ${anyState ? "" : "live "}sessions — specify a target:\n${formatSessions(pool)}`, 4);
 	}
 	const lower = token.toLowerCase();
 	// Precedence levels; ambiguity is only an error within the same level.
@@ -105,17 +114,40 @@ function resolveTarget(token) {
 		(s) => String(s.cwd).toLowerCase().endsWith(lower),
 	];
 	for (const predicate of levels) {
-		const matches = live.filter(predicate);
+		const matches = pool.filter(predicate);
 		if (matches.length === 1) return matches[0];
-		if (matches.length > 1) fail(`"${token}" is ambiguous:\n${formatSessions(matches)}`, 4);
+		if (matches.length > 1) {
+			// Prefer the single live match over stale/closed namesakes.
+			const liveMatches = matches.filter((s) => s.state === "live");
+			if (liveMatches.length === 1) return liveMatches[0];
+			fail(`"${token}" is ambiguous:\n${formatSessions(matches)}`, 4);
+		}
 	}
-	fail(`No live session matches "${token}". Live sessions:\n${formatSessions(live)}`, 3);
+	// Exit 4, not 3: sessions exist, the token just matched none of them —
+	// the remedy is fixing the target, not reinstalling the bridge.
+	fail(`No ${anyState ? "" : "live "}session matches "${token}". Sessions:\n${formatSessions(pool)}`, 4);
 }
 
 // --- outbox reader: stateful, rewind-safe (roadmap #5) ----------------------
 
 function makeOutboxReader(outbox) {
 	const state = { ino: null, offset: 0, seen: new Set() };
+
+	function readRange(file, from, to) {
+		if (to <= from) return null;
+		const buffer = Buffer.alloc(Number(to - from));
+		let fd;
+		try {
+			fd = fs.openSync(file, "r");
+			fs.readSync(fd, buffer, 0, buffer.length, from);
+			return buffer;
+		} catch {
+			return null;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+
 	return function readNew() {
 		let stat;
 		try {
@@ -123,27 +155,41 @@ function makeOutboxReader(outbox) {
 		} catch {
 			return [];
 		}
-		if (state.ino !== null && (stat.ino !== state.ino || stat.size < state.offset)) {
-			state.offset = 0; // rotated or truncated: rescan, dedupe below
+		const chunks = [];
+		if (state.ino !== null && stat.ino !== state.ino) {
+			// The bridge rotates by renaming outbox.jsonl → outbox.1.jsonl and starting
+			// fresh. Drain the tail of the renamed file (same inode we were reading)
+			// before switching, so nothing written between polls is lost.
+			try {
+				const rotated = `${outbox.replace(/\.jsonl$/, "")}.1.jsonl`;
+				const rstat = fs.statSync(rotated);
+				if (rstat.ino === state.ino) {
+					const tail = readRange(rotated, state.offset, rstat.size);
+					if (tail) chunks.push(tail);
+				}
+			} catch {
+				// Rotated file gone (pruned): dedupe below is the only safety net left.
+			}
+			state.offset = 0;
+		} else if (stat.size < state.offset) {
+			state.offset = 0; // truncated: rescan, dedupe below
 		}
 		state.ino = stat.ino;
-		if (stat.size <= state.offset) return [];
-		const length = stat.size - state.offset;
-		const buffer = Buffer.alloc(Number(length));
-		let fd;
-		try {
-			fd = fs.openSync(outbox, "r");
-			fs.readSync(fd, buffer, 0, buffer.length, state.offset);
-		} catch {
-			return [];
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
+		if (stat.size > state.offset) {
+			const fresh = readRange(outbox, state.offset, stat.size);
+			if (fresh) {
+				const lastNewline = fresh.lastIndexOf(0x0a);
+				if (lastNewline !== -1) {
+					state.offset += lastNewline + 1;
+					chunks.push(fresh.subarray(0, lastNewline + 1));
+				}
+			}
 		}
-		const lastNewline = buffer.lastIndexOf(0x0a);
-		if (lastNewline === -1) return [];
-		state.offset += lastNewline + 1;
+		if (chunks.length === 0) return [];
+		// Dedupe only matters across rotation/truncation rescans; a bounded set is fine.
+		if (state.seen.size > 20_000) state.seen.clear();
 		const items = [];
-		for (const line of buffer.subarray(0, lastNewline + 1).toString("utf8").split("\n")) {
+		for (const line of Buffer.concat(chunks).toString("utf8").split("\n")) {
 			const trimmed = line.trim();
 			if (!trimmed) continue;
 			let record;
@@ -152,7 +198,7 @@ function makeOutboxReader(outbox) {
 			} catch {
 				continue;
 			}
-			const key = `${record.type}|${record.id ?? ""}|${record.ts ?? ""}`;
+			const key = `${record.type}|${record.id ?? ""}|${record.runId ?? ""}|${record.kind ?? ""}|${record.ts ?? ""}`;
 			if (state.seen.has(key)) continue;
 			state.seen.add(key);
 			items.push(record);
@@ -197,6 +243,8 @@ async function waitForOutcome(target, payload, flags) {
 	let accepted = false;
 	let bound = false;
 	let foreignSeen = false;
+	let reattachDeadline = null; // set while waiting for bridge_ready after bridge_closed
+	let closeReason = null;
 	const myRuns = new Set();
 	const isPrompt = payload.action === "prompt" || payload.action === "interrupt";
 
@@ -271,41 +319,50 @@ async function waitForOutcome(target, payload, flags) {
 					const weaklyOwned =
 						record.owner === null && !bound && !isPrompt && !foreignSeen && !record.foreignInputSeen;
 					if (!owned && !weaklyOwned) break;
+					if (owned && record.foreignInputSeen && isPrompt && !flags.acceptPartial) {
+						fail(
+							"Attribution uncertain: the user typed into the Atomic session during your turn.\nInspect manually: tail " +
+								target.id.slice(0, 8),
+							6,
+						);
+					}
 					if (record.provisional && myRuns.size > 0) break; // workflow still running
 					if (record.provisional && Array.isArray(record.pendingWork)) {
 						for (const work of record.pendingWork) if (work.runId) myRuns.add(work.runId);
 						console.error("note: turn settled with detached async work — waiting for workflow completion");
 						break;
 					}
+					if (owned && record.foreignInputSeen)
+						console.error("note: concurrent user input during the turn — reply may reflect it (--accept-partial)");
 					if (weaklyOwned) console.error("note: weak attribution (steer/follow_up binding is best-effort)");
 					console.log(record.text ?? "(agent settled with no assistant text)");
 					return 0;
 				}
-				case "bridge_closed": {
-					const reattachUntil = Date.now() + (flags.reattachWindowS ?? 20) * 1000;
-					let reattached = false;
-					while (Date.now() < reattachUntil) {
-						await sleep(500);
-						if (readNew().some((r) => r.type === "bridge_ready")) {
-							reattached = true;
-							break;
-						}
+				case "bridge_ready":
+					if (reattachDeadline !== null) {
+						console.error(`note: session ${closeReason === "reload" ? "reloaded" : "replaced"} — reattached`);
+						reattachDeadline = null;
+						closeReason = null;
 					}
-					if (reattached) {
-						console.error(`note: session ${record.reason === "reload" ? "reloaded" : "replaced"} — reattached`);
-						break;
-					}
-					fail(
-						record.reason === "quit"
-							? "The Atomic session quit before replying."
-							: `The Atomic session was ${record.reason}ed; the command may be lost. Check: tail ${target.id.slice(0, 8)}`,
-						5,
-					);
 					break;
-				}
+				case "bridge_closed":
+					// Don't fail yet: /reload and /new re-arm the same bridge directory.
+					// Keep processing records (a settle may already be in the outbox) and
+					// give bridge_ready a bounded window to show up.
+					reattachDeadline = Date.now() + REATTACH_WINDOW_MS;
+					closeReason = record.reason ?? "quit";
+					break;
 				default:
 					break;
 			}
+		}
+		if (reattachDeadline !== null && Date.now() > reattachDeadline) {
+			fail(
+				closeReason === "quit"
+					? "The Atomic session quit before replying."
+					: `The Atomic session was ${closeReason}ed; the command may be lost. Check: tail ${target.id.slice(0, 8)}`,
+				5,
+			);
 		}
 		const idleMs = Date.now() - lastActivityAt;
 		const totalMs = Date.now() - startedAt;
@@ -355,7 +412,7 @@ function parseArgs(args) {
 		acceptPartial: false,
 		messageFile: null,
 		lines: 20,
-		forS: 0,
+		forS: null, // null = command default (DEFAULT_FOLLOW_S); 0 = unbounded
 		olderThanDays: PRUNE_DEFAULT_DAYS,
 		json: false,
 		all: false,
@@ -400,13 +457,14 @@ Commands:
        [--mode prompt|steer|follow_up|interrupt] [--wait]
        [--idle-timeout <s>=120] [--timeout <s>] [--accept-partial]
        [--message-file <path>] [-v]
-  tail <target> [--lines <n>]  Print recent outbox records
-  follow <target> [--for <s>]  Stream outbox records as they arrive
+  tail <target> [--lines <n>]  Print recent outbox records (works on closed sessions)
+  follow <target> [--for <s>]  Stream outbox records (default 30s; --for 0 = forever)
   abort <target>               Abort the session's current turn
   prune [--older-than <days>]  Delete CLOSED session dirs (never live ones)
 
-Exit codes: 0 ok · 1 usage · 2 timeout · 3 no session · 4 ambiguous
-            5 bridge/run error · 6 attribution uncertain · 7 async work detached`;
+Exit codes: 0 ok · 1 usage · 2 timeout · 3 no session recorded/delivery refused
+            4 target not found or ambiguous · 5 bridge/run error
+            6 attribution uncertain · 7 async work detached`;
 
 async function main() {
 	const [command, ...argv] = process.argv.slice(2);
@@ -427,35 +485,21 @@ async function main() {
 			console.log(formatSessions(sessions));
 			return;
 		}
-		case "ping": {
-			const target = resolveTarget(rest[0]);
-			process.exit(
-				await waitForOutcome(
-					target,
-					{ id: newCommandId(), action: "ping" },
-					{ ...flags, idleTimeoutS: 10, timeoutS: 10 },
-				),
-			);
-			break;
-		}
-		case "status": {
-			const target = resolveTarget(rest[0]);
-			process.exit(
-				await waitForOutcome(
-					target,
-					{ id: newCommandId(), action: "status" },
-					{ ...flags, idleTimeoutS: 10, timeoutS: 10 },
-				),
-			);
-			break;
-		}
+		case "ping":
+		case "status":
 		case "abort": {
 			const target = resolveTarget(rest[0]);
+			// Snappy defaults for round-trips, but an explicit --timeout/--idle-timeout wins.
+			const quickS = command === "abort" ? 15 : QUICK_TIMEOUT_S;
 			process.exit(
 				await waitForOutcome(
 					target,
-					{ id: newCommandId(), action: "abort" },
-					{ ...flags, idleTimeoutS: 15, timeoutS: 15 },
+					{ id: newCommandId(), action: command },
+					{
+						...flags,
+						idleTimeoutS: flags.idleTimeoutS !== DEFAULT_IDLE_TIMEOUT_S ? flags.idleTimeoutS : quickS,
+						timeoutS: flags.timeoutS > 0 ? flags.timeoutS : quickS,
+					},
 				),
 			);
 			break;
@@ -486,7 +530,7 @@ async function main() {
 			break;
 		}
 		case "tail": {
-			const target = resolveTarget(rest[0]);
+			const target = resolveTarget(rest[0], { anyState: true });
 			const outbox = path.join(target.dir, "outbox.jsonl");
 			if (!fs.existsSync(outbox)) {
 				console.log("(outbox empty)");
@@ -497,9 +541,12 @@ async function main() {
 			return;
 		}
 		case "follow": {
-			const target = resolveTarget(rest[0]);
+			const target = resolveTarget(rest[0], { anyState: true });
 			const readNew = makeOutboxReader(path.join(target.dir, "outbox.jsonl"));
-			const until = flags.forS > 0 ? Date.now() + flags.forS * 1000 : Number.POSITIVE_INFINITY;
+			// Bounded by default so scripted callers always get their terminal back;
+			// --for 0 opts into an unbounded stream.
+			const forS = flags.forS === null ? DEFAULT_FOLLOW_S : flags.forS;
+			const until = forS > 0 ? Date.now() + forS * 1000 : Number.POSITIVE_INFINITY;
 			for (const record of readNew()) console.log(JSON.stringify(record));
 			while (Date.now() < until) {
 				await sleep(POLL_MS);

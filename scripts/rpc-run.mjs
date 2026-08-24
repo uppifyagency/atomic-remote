@@ -27,7 +27,7 @@ for (let i = 0; i < args.length; i++) {
 }
 
 const prompt = promptParts.join(" ").trim();
-if (!prompt) {
+if (!prompt || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
 	console.error("Usage: rpc-run.mjs [--atomic <bin>] [--model <provider/model>] [--timeout <s>] <prompt...>");
 	process.exit(1);
 }
@@ -70,13 +70,18 @@ function handleLine(line) {
 		process.stdout.write(event.assistantMessageEvent.delta);
 	}
 	if (event.type === "response" && event.success === false) {
+		// A rejected prompt never produces agent_end — terminate now, and loudly.
 		console.error(`\nRPC error (${event.command}): ${event.error}`);
+		clearTimeout(timer);
+		child.kill();
+		process.exit(1);
 	}
 	if (event.type === "agent_end") {
 		if (printed) process.stdout.write("\n");
 		clearTimeout(timer);
 		child.kill();
-		process.exit(0);
+		// Keep exit 2 when this agent_end came from the timeout abort.
+		process.exit(process.exitCode ?? 0);
 	}
 }
 

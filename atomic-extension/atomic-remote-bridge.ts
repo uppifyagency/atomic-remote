@@ -36,7 +36,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.2.0";
+const BRIDGE_VERSION = "0.2.1";
 const PROTOCOL = 2;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -44,14 +44,14 @@ const MAX_COMMAND_BYTES = 64 * 1024;
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BATCH_PER_TICK = 32;
 const OUTBOX_MAX_BYTES = 8 * 1024 * 1024;
-const BRIDGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const BRIDGE_KEEP_MOST_RECENT = 50;
-const INBOX_SAFETY_SCAN_MS = 1_000;
+const INBOX_SAFETY_SCAN_MS = 10_000; // backstop only; fs.watch is the primary trigger
 const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const RUN_ID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// Controller filenames are <ts:14>-<seq:3>-<id>.json; anything else yields id=null.
+const PROCESSING_ID_PATTERN = /^\d{14}-\d{3}-([A-Za-z0-9_-]{1,64})\.json\.processing$/;
 const WORKFLOW_TERMINAL_KINDS = ["completed", "failed", "blocked", "quit"] as const;
-const WORKFLOW_LIFECYCLE_KINDS = [...WORKFLOW_TERMINAL_KINDS, "paused", "resumed", "started"] as const;
+const WORKFLOW_LIFECYCLE_KINDS = [...WORKFLOW_TERMINAL_KINDS, "paused", "resumed"] as const;
 
 type MessagelessAction = "ping" | "status" | "abort";
 type MessageAction = "prompt" | "steer" | "follow_up" | "interrupt";
@@ -151,6 +151,7 @@ export default function (pi: ExtensionAPI) {
 	let safetyTimer: ReturnType<typeof setInterval> | undefined;
 	let workflowTimer: ReturnType<typeof setInterval> | undefined;
 	let outboxModeApplied = false;
+	let outboxApproxBytes = -1; // -1 = unknown; measured once, then tracked per append
 	let agentRunning = false;
 
 	// Attribution state (roadmap #2).
@@ -174,18 +175,23 @@ export default function (pi: ExtensionAPI) {
 				fs.chmodSync(outboxPath, 0o600);
 				outboxModeApplied = true;
 			}
-			try {
-				const stat = fs.statSync(outboxPath);
-				if (stat.size > OUTBOX_MAX_BYTES) {
-					fs.appendFileSync(outboxPath, `${JSON.stringify({ type: "outbox_rotated", ts: new Date().toISOString() })}\n`);
-					fs.renameSync(outboxPath, `${outboxPath.replace(/\.jsonl$/, "")}.1.jsonl`);
+			if (outboxApproxBytes < 0) {
+				try {
+					outboxApproxBytes = fs.statSync(outboxPath).size;
+				} catch {
+					outboxApproxBytes = 0; // first write: file does not exist yet
 				}
-			} catch {
-				// First write: file does not exist yet.
 			}
-			fs.appendFileSync(outboxPath, `${JSON.stringify({ ...record, ts: new Date().toISOString() })}\n`, {
-				mode: 0o600,
-			});
+			if (outboxApproxBytes > OUTBOX_MAX_BYTES) {
+				// Readers drain the renamed file from their last offset before switching
+				// to the fresh one (same inode), so rotation loses nothing.
+				fs.appendFileSync(outboxPath, `${JSON.stringify({ type: "outbox_rotated", ts: new Date().toISOString() })}\n`);
+				fs.renameSync(outboxPath, `${outboxPath.replace(/\.jsonl$/, "")}.1.jsonl`);
+				outboxApproxBytes = 0;
+			}
+			const line = `${JSON.stringify({ ...record, ts: new Date().toISOString() })}\n`;
+			fs.appendFileSync(outboxPath, line, { mode: 0o600 });
+			outboxApproxBytes += Buffer.byteLength(line);
 			outboxModeApplied = true;
 		} catch {
 			// Outbox unwritable: nothing useful to do from inside the engine.
@@ -237,37 +243,8 @@ export default function (pi: ExtensionAPI) {
 		workflowTimer = undefined;
 	};
 
-	const gcClosedSessions = () => {
-		let entries: string[];
-		try {
-			entries = fs.readdirSync(bridgeRoot);
-		} catch {
-			return;
-		}
-		const closed: Array<{ dir: string; startedAt: number }> = [];
-		for (const entry of entries) {
-			const dir = path.join(bridgeRoot, entry);
-			try {
-				const real = fs.realpathSync(dir);
-				if (path.relative(fs.realpathSync(bridgeRoot), real).startsWith("..")) continue;
-				const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as Record<string, unknown>;
-				if (meta.status !== "closed") continue;
-				closed.push({ dir, startedAt: Date.parse(String(meta.startedAt ?? "")) || 0 });
-			} catch {
-				// Unreadable entry: leave it alone; the explicit prune command handles it.
-			}
-		}
-		closed.sort((a, b) => b.startedAt - a.startedAt);
-		const now = Date.now();
-		closed.forEach(({ dir, startedAt }, index) => {
-			if (index < BRIDGE_KEEP_MOST_RECENT && now - startedAt < BRIDGE_RETENTION_MS) return;
-			try {
-				fs.rmSync(dir, { recursive: true, force: true });
-			} catch {
-				// Best-effort GC.
-			}
-		});
-	};
+	// Deliberately no automatic GC: the protocol guarantees nothing is deleted
+	// implicitly. Cleanup happens only via the controller's explicit `prune`.
 
 	// --- Workflow lifecycle mirroring (roadmap #3) -------------------------
 
@@ -288,12 +265,17 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				continue;
 			}
+			// Best-effort inference: lifecycle notices are recognized by runId plus a
+			// terminal keyword in an entry that also mentions "workflow". A false
+			// negative degrades to exit 7 at timeout; this guard narrows the false
+			// positives (e.g. an assistant message quoting the runId near "completed").
+			if (!/workflow/i.test(serialized)) continue;
 			for (const [runId, run] of knownRuns) {
 				if (run.terminal || !serialized.includes(runId)) continue;
 				const kind = WORKFLOW_LIFECYCLE_KINDS.find((candidate) =>
 					new RegExp(`\\b${candidate}\\b`, "i").test(serialized),
 				);
-				if (!kind || kind === "started") continue;
+				if (!kind) continue;
 				const terminal = (WORKFLOW_TERMINAL_KINDS as readonly string[]).includes(kind);
 				if (terminal) run.terminal = true;
 				emit({
@@ -404,6 +386,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 			}
 		} catch (error) {
+			if (cmd.action === "interrupt" && interruptPending === cmd.id) interruptPending = null;
+			if (cmd.action !== "ping" && cmd.action !== "status" && cmd.action !== "abort") {
+				pendingBindings.delete(normalizeForBinding(cmd.message));
+			}
 			emit({ type: "error", id: cmd.id, error: error instanceof Error ? error.message : String(error) });
 		}
 	};
@@ -493,7 +479,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		for (const name of names.filter((n) => n.endsWith(".processing"))) {
-			const match = name.match(/([A-Za-z0-9_-]{1,64})\.json\.processing$/);
+			const match = name.match(PROCESSING_ID_PATTERN);
 			emit({
 				type: "error",
 				id: match ? match[1] : null,
@@ -527,7 +513,18 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		stopTimersAndWatcher();
-		gcClosedSessions();
+
+		// A session switch (/new, /resume, /fork) reuses this engine process:
+		// everything scoped to the previous session must not leak into this one.
+		pendingBindings.clear();
+		interruptPending = null;
+		activeOwner = null;
+		foreignSinceLastSettle = false;
+		lastTextForOwner = null;
+		knownRuns.clear();
+		entryCursor = 0;
+		agentRunning = false;
+		outboxApproxBytes = -1;
 
 		let sessionId: string | null = null;
 		try {
@@ -623,7 +620,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (source === "interactive") {
-			activeOwner = null;
+			// Keep a bound owner: the settle still belongs to that command, but it
+			// carries foreignInputSeen so the controller can refuse (exit 6) instead
+			// of the reply silently vanishing under an unmatchable owner:null.
 			foreignSinceLastSettle = true;
 			emit({ type: "foreign_input", preview: normalizeForBinding(text).slice(0, 120) });
 		}
@@ -664,6 +663,9 @@ export default function (pi: ExtensionAPI) {
 		});
 		ensureWorkflowTimer(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
 		activeOwner = null;
+		// An interrupt binding that never claimed a turn is stale once the session
+		// settles; leaving it set would misattribute the next unrelated turn.
+		interruptPending = null;
 		foreignSinceLastSettle = false;
 		lastTextForOwner = null;
 	});

@@ -42,8 +42,8 @@ Two control planes. Pick by situation:
    |---|---|---|
    | 0 | stdout is the attributed reply | Report it as Atomic's answer |
    | 2 | Timeout, session may still be working | Re-check later with `tail`; do NOT resend the prompt |
-   | 3 | No live session / stale heartbeat | Tell the user to `/reload` in Atomic (or run setup) |
-   | 4 | Ambiguous target | Show the listed candidates, pick or ask |
+   | 3 | No session recorded / delivery refused (stale heartbeat) | Tell the user to `/reload` in Atomic (or run setup) |
+   | 4 | Target not found or ambiguous | Fix the target: show the listed candidates, pick or ask — do NOT suggest reinstalling |
    | 5 | Bridge/run error (incl. failed workflow) | Report the error verbatim |
    | 6 | Attribution uncertain (user typed concurrently) | Report NOTHING as Atomic's reply; inspect with `tail` |
    | 7 | Workflow still running detached (run id printed) | Report the run id and that work continues; check later with `follow`/`tail` — do NOT present intermediate text as the result |
@@ -52,8 +52,10 @@ Two control planes. Pick by situation:
    its terminal notice (`workflow_lifecycle` records). Never present "Workflow started"
    text as a final result — that is exactly the failure mode v2 exists to prevent.
 
-6. **Observe live**: `follow <target>` streams outbox records (one JSON per line);
-   `tail <target> --lines 30` shows recent history — it survives session shutdown.
+6. **Observe live**: `follow <target>` streams outbox records (one JSON per line;
+   bounded, 30 s by default — `--for <s>` to change, `--for 0` to stream forever);
+   `tail <target> --lines 30` shows recent history. Both work on stale/closed
+   sessions too — history survives session shutdown.
 
 ## Troubleshooting
 

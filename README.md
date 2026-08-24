@@ -5,7 +5,7 @@
 <br><br>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-38bdf8?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.1-38bdf8?style=flat-square)](CHANGELOG.md)
 [![Protocol](https://img.shields.io/badge/protocol-v2-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v2-guarantees)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-4ade80?style=flat-square)](#)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
@@ -58,7 +58,7 @@ claude plugin install atomic-remote@atomic-remote
 
 **2. Atomic side** — from any Claude Code session run `/atomic-remote:setup`
 (or manually: `node scripts/install-bridge.mjs`). Then, **inside the running Atomic
-session**, run `/reload`. You'll see: `atomic-remote bridge v0.2.0 active (…)`.
+session**, run `/reload`. You'll see: `atomic-remote bridge v0.2.1 active (…)`.
 
 Sessions are named automatically after their working directory; override with
 `/remote-name <name>` inside Atomic or `/name` (tracked automatically).
@@ -84,7 +84,7 @@ node scripts/atomic-ctl.mjs status <target>
 node scripts/atomic-ctl.mjs send <target|auto> "message" \
     [--mode prompt|steer|follow_up|interrupt] [--wait] \
     [--idle-timeout <s>] [--timeout <s>] [--message-file <path>]
-node scripts/atomic-ctl.mjs follow <target> [--for <s>]
+node scripts/atomic-ctl.mjs follow <target> [--for <s>]   # default 30s; --for 0 = forever
 node scripts/atomic-ctl.mjs tail <target> [--lines <n>]
 node scripts/atomic-ctl.mjs abort <target>
 node scripts/atomic-ctl.mjs prune [--older-than <days>]
@@ -124,8 +124,8 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 |---|---|
 | 0 | Completed; stdout is the attributed reply |
 | 2 | Idle/absolute timeout (session may still be working — check `tail`) |
-| 3 | No live session / delivery refused (stale heartbeat) |
-| 4 | Ambiguous target |
+| 3 | No session recorded / delivery refused (stale heartbeat) |
+| 4 | Target not found or ambiguous |
 | 5 | Bridge or run error (including failed workflows) |
 | 6 | Attribution uncertain — concurrent user input; inspect with `tail` |
 | 7 | Detached async work still running (workflow run id printed) |
