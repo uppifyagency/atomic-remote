@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { makeAgentDir, makeSession, runCtl, sleep } from "./helpers.mjs";
+import fs from "node:fs";
+import { CTL, makeAgentDir, makeSession, runCtl, sleep } from "./helpers.mjs";
+
+// Read the controller's real poll interval so these waits can't drift from it.
+const CTL_POLL_MS = Number(fs.readFileSync(CTL, "utf8").match(/POLL_MS = (\d+)/)[1]);
+// Three poll cycles guarantee the controller consumed everything emitted so far.
+const DRAIN_MS = 3 * CTL_POLL_MS;
 
 function armedSession() {
 	const agentDir = makeAgentDir();
@@ -201,7 +207,7 @@ test("send --wait: outbox rotation mid-wait loses nothing", async () => {
 	const cmd = await session.nextInboxCommand();
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
 	session.emit({ type: "turn_bound", id: cmd.id });
-	await sleep(700);
+	await sleep(DRAIN_MS);
 	session.rotateOutbox();
 	session.emit({ type: "agent_settled", owner: cmd.id, foreignInputSeen: false, text: "survived rotation" });
 	const result = await ctl;
@@ -216,7 +222,7 @@ test("send --wait: /reload inside the window reattaches and still resolves", asy
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
 	session.emit({ type: "turn_bound", id: cmd.id });
 	session.emit({ type: "bridge_closed", reason: "reload", targetSessionFile: null });
-	await sleep(600);
+	await sleep(DRAIN_MS);
 	session.emit({ type: "bridge_ready", id: session.id, protocol: 2 });
 	session.emit({ type: "agent_settled", owner: cmd.id, foreignInputSeen: false, text: "back after reload" });
 	const result = await ctl;

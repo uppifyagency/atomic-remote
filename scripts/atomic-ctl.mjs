@@ -460,7 +460,7 @@ Commands:
   tail <target> [--lines <n>]  Print recent outbox records (works on closed sessions)
   follow <target> [--for <s>]  Stream outbox records (default 30s; --for 0 = forever)
   abort <target>               Abort the session's current turn
-  prune [--older-than <days>]  Delete CLOSED session dirs (never live ones)
+  prune [--older-than <days>]  Delete closed/long-stale session dirs (never live ones)
 
 Exit codes: 0 ok · 1 usage · 2 timeout · 3 no session recorded/delivery refused
             4 target not found or ambiguous · 5 bridge/run error
@@ -563,16 +563,28 @@ async function main() {
 			}
 			let removed = 0;
 			for (const session of listSessions()) {
-				if (session.state !== "closed") continue;
-				// Age from closedAt: a long-lived session closed an hour ago is not "old".
-				const closedAt = Date.parse(String(session.closedAt ?? session.startedAt ?? "")) || 0;
-				if (closedAt > cutoff) continue;
+				if (session.state === "live") continue;
+				// Age from the last sign of life, not from startedAt: a long-lived session
+				// closed an hour ago is not "old". Crashed and v1 sessions never reach
+				// status "closed", so stale ones age by their last heartbeat instead of
+				// leaking forever.
+				let lastSeen;
+				if (session.state === "closed") {
+					lastSeen = Date.parse(String(session.closedAt ?? session.startedAt ?? "")) || 0;
+				} else {
+					try {
+						lastSeen = Number(JSON.parse(fs.readFileSync(path.join(session.dir, "heartbeat.json"), "utf8")).ts) || 0;
+					} catch {
+						lastSeen = Date.parse(String(session.startedAt ?? "")) || 0;
+					}
+				}
+				if (lastSeen > cutoff) continue;
 				const real = fs.realpathSync(session.dir);
 				if (path.relative(realRoot, real).startsWith("..")) continue; // symlink escape guard
 				fs.rmSync(session.dir, { recursive: true, force: true });
 				removed++;
 			}
-			console.log(`Pruned ${removed} closed session dir(s).`);
+			console.log(`Pruned ${removed} session dir(s) (closed or long-stale).`);
 			return;
 		}
 		case "--help":

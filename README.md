@@ -83,7 +83,8 @@ node scripts/atomic-ctl.mjs ping <target>
 node scripts/atomic-ctl.mjs status <target>
 node scripts/atomic-ctl.mjs send <target|auto> "message" \
     [--mode prompt|steer|follow_up|interrupt] [--wait] \
-    [--idle-timeout <s>] [--timeout <s>] [--message-file <path>]
+    [--idle-timeout <s>] [--timeout <s>] [--message-file <path>] \
+    [--accept-partial] [-v|--verbose]
 node scripts/atomic-ctl.mjs follow <target> [--for <s>]   # default 30s; --for 0 = forever
 node scripts/atomic-ctl.mjs tail <target> [--lines <n>]
 node scripts/atomic-ctl.mjs abort <target>
@@ -113,7 +114,9 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
   heartbeat — not on a transient engine pid that Atomic legitimately replaces.
   Delivery to a dead bridge is refused up front, not discovered by timeout.
 - **Nothing is deleted implicitly.** `list` is read-only; history survives session
-  shutdown; cleanup happens only via the explicit `prune` command, closed sessions only.
+  shutdown; cleanup happens only via the explicit `prune` command (closed sessions
+  past the cutoff, plus stale ones whose last heartbeat is older than it — never
+  live ones).
 - **Fail-closed inbox.** Schema-validated commands, `O_NOFOLLOW` + regular-file +
   64 KiB checks, serial processing, at-least-once semantics with restart recovery,
   an ack for every command — including malformed ones.
@@ -123,6 +126,7 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 | Code | Meaning |
 |---|---|
 | 0 | Completed; stdout is the attributed reply |
+| 1 | Usage error (unknown flag or malformed arguments) |
 | 2 | Idle/absolute timeout (session may still be working — check `tail`) |
 | 3 | No session recorded / delivery refused (stale heartbeat) |
 | 4 | Target not found or ambiguous |

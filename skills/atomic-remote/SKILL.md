@@ -37,12 +37,16 @@ Two control planes. Pick by situation:
      dedicated `/atomic-remote:interrupt` command).
    - Long tasks: raise `--idle-timeout` (resets on any bridge activity) rather than
      setting a huge absolute `--timeout`.
+   - `--accept-partial` opts into a reply contaminated by concurrent user input
+     (turns exit 6 into exit 0 with a warning); `-v`/`--verbose` traces bridge
+     records on stderr.
 
 4. **Read the outcome — exit codes are the contract** (do not improvise):
 
    | Exit | Meaning | What YOU do |
    |---|---|---|
    | 0 | stdout is the attributed reply | Report it as Atomic's answer |
+   | 1 | Usage error (unknown flag, bad arguments) | Fix the command line; do NOT retry it unchanged |
    | 2 | Timeout, session may still be working | Re-check later with `tail`; do NOT resend the prompt |
    | 3 | No session recorded / delivery refused (stale heartbeat) | Tell the user to `/reload` in Atomic (or run setup) |
    | 4 | Target not found or ambiguous | Fix the target: show the listed candidates, pick or ask — do NOT suggest reinstalling |

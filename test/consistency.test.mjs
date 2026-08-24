@@ -41,11 +41,30 @@ test("every controller flag the docs teach actually exists", () => {
 });
 
 test("every exit code the controller can produce is documented in the skill and README", () => {
-	const codes = ["0", "2", "3", "4", "5", "6", "7"];
+	// Derived from the source: fail() defaults to 1, plus every literal fail/exit code.
+	const ctlSource = read("scripts/atomic-ctl.mjs");
+	const codes = new Set(["1"]);
+	for (const match of ctlSource.matchAll(/fail\((?:[^()]|\([^()]*\))*,\s*(\d)\s*,?\s*\)/g)) codes.add(match[1]);
+	codes.add("0");
+	assert.ok(codes.size >= 8, `expected the full taxonomy, extracted only: ${[...codes].join(",")}`);
 	for (const doc of ["README.md", "skills/atomic-remote/SKILL.md"]) {
 		const content = read(doc);
-		for (const code of codes) {
+		for (const code of [...codes].sort()) {
 			assert.ok(new RegExp(`\\|\\s*${code}\\s*\\|`).test(content), `${doc} is missing an exit-code table row for ${code}`);
 		}
+	}
+});
+
+test("every controller flag exists in the docs (code to docs)", () => {
+	const ctlSource = read("scripts/atomic-ctl.mjs");
+	const ctlFlags = new Set([...ctlSource.matchAll(/"(--[a-z-]+)":/g)].map((m) => m[1]));
+	const docs = [
+		read("README.md"),
+		read("skills/atomic-remote/SKILL.md"),
+		...fs.readdirSync(path.join(root, "commands")).map((name) => read(`commands/${name}`)),
+	].join("\n");
+	for (const flag of ctlFlags) {
+		if (flag === "--help") continue;
+		assert.ok(docs.includes(flag), `${flag} exists in atomic-ctl.mjs but no doc mentions it`);
 	}
 });

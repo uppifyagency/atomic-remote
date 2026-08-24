@@ -223,9 +223,9 @@ test("prune: removes only closed sessions past the cutoff, never live or stale",
 	});
 	const result = await runCtl(["prune"], agentDir);
 	assert.equal(result.code, 0);
-	assert.match(result.stdout, /Pruned 1 closed session dir/);
+	assert.match(result.stdout, /Pruned 1 session dir/);
 	assert.ok(fs.existsSync(live.dir), "live session must survive prune");
-	assert.ok(fs.existsSync(stale.dir), "stale session must survive prune");
+	assert.ok(fs.existsSync(stale.dir), "recently-seen stale session must survive prune");
 	assert.ok(!fs.existsSync(oldClosed.dir), "old closed session should be pruned");
 });
 
@@ -240,6 +240,23 @@ test("prune: a recently closed session survives even when it started long ago", 
 	const result = await runCtl(["prune"], agentDir);
 	assert.equal(result.code, 0);
 	assert.ok(fs.existsSync(longLived.dir), "session closed an hour ago must survive a 7-day prune");
+});
+
+test("prune: a long-dead stale session is reclaimed; a recently-seen one survives", async () => {
+	const agentDir = makeAgentDir();
+	const longDead = makeSession(agentDir, { id: "pr-dead", heartbeat: "none" });
+	longDead.heartbeat({ ageMs: 10 * DAY_MS });
+	const recentlySeen = makeSession(agentDir, { id: "pr-seen", heartbeat: "stale" });
+	const noHeartbeatOld = makeSession(agentDir, {
+		id: "pr-v1",
+		heartbeat: "none",
+		startedAt: new Date(Date.now() - 10 * DAY_MS).toISOString(),
+	});
+	const result = await runCtl(["prune"], agentDir);
+	assert.equal(result.code, 0);
+	assert.ok(!fs.existsSync(longDead.dir), "a session silent for 10 days should be reclaimed");
+	assert.ok(fs.existsSync(recentlySeen.dir), "a session seen a minute ago must survive");
+	assert.ok(!fs.existsSync(noHeartbeatOld.dir), "an old v1 session with no heartbeat should be reclaimed by startedAt");
 });
 
 test("prune: symlinked session dir pointing outside the root is skipped", async () => {

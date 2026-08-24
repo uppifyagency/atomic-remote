@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 67 tests
+- **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 69 tests
   covering the controller end-to-end (target resolution, exit-code contract,
   wait-loop state machine, outbox rotation, reattach, prune safety), the bridge
   extension imported as a real module (validation matrix, serial ingestion,
@@ -14,10 +14,24 @@
   already writes; `list --json` carries a `busy` field. Answering "is it safe
   to send?" no longer requires a `status` round-trip.
 
+### Changed
+- **`list` human output gained a column**: busy/idle sits between the state
+  and `name=`. Anything parsing the plain-text columns positionally must
+  adjust; `list --json` remains the stable machine surface.
+- **`prune` now also reclaims long-stale sessions.** Crashed and v1 bridges
+  never reach `status: "closed"`, so their dirs used to leak forever. A stale
+  session whose last heartbeat is older than `--older-than` is now pruned;
+  live sessions are still never touched, and cleanup still happens only via
+  the explicit `prune` command.
+
 ### Fixed
 - **`prune` now ages closed sessions by `closedAt`, not `startedAt`.** A
   long-lived session closed an hour ago no longer loses its entire history to
   a default 7-day prune just because it *started* more than 7 days ago.
+- **Documented exit code 1 (usage error)** in the README and skill exit-code
+  tables, and documented `--accept-partial` and `-v`/`--verbose`; a
+  consistency test now derives the exit-code taxonomy from the source and
+  checks both docs→code and code→docs flag coverage.
 
 ## [0.2.1] — 2026-08-24
 
