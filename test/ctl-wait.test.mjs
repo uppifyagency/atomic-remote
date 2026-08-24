@@ -132,6 +132,35 @@ test("send --wait: steer-fallback delivery is surfaced on stderr", async () => {
 	assert.match(result.stderr, /contended/);
 });
 
+test("send --wait: an owned settle marked aborted exits 5, never a silent empty success", async () => {
+	const { agentDir, session } = armedSession();
+	const ctl = runCtl(["send", session.id, "doomed prompt", "--wait"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
+	session.emit({ type: "turn_bound", id: cmd.id });
+	session.emit({ type: "agent_settled", owner: cmd.id, aborted: true, foreignInputSeen: false, text: null });
+	const result = await ctl;
+	assert.equal(result.code, 5);
+	assert.match(result.stderr, /aborted/);
+	assert.equal(result.stdout.trim(), "");
+});
+
+test("send --mode interrupt --wait on a busy session: the reply is attributed, exit 0", async () => {
+	const { agentDir, session } = armedSession();
+	const ctl = runCtl(["send", session.id, "drop everything, do X", "--mode", "interrupt", "--wait"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "interrupt", contended: true });
+	session.emit({ type: "agent_end", owner: "someone-else", text: null });
+	session.emit({ type: "turn_bound", id: cmd.id, via: "interrupt" });
+	session.emit({ type: "agent_start", owner: cmd.id });
+	session.emit({ type: "agent_settled", owner: "someone-else", aborted: true, foreignInputSeen: false, text: null });
+	session.emit({ type: "agent_end", owner: cmd.id, text: "INTERRUPT-VISTO-OK" });
+	session.emit({ type: "agent_settled", owner: cmd.id, foreignInputSeen: false, text: "INTERRUPT-VISTO-OK" });
+	const result = await ctl;
+	assert.equal(result.code, 0);
+	assert.equal(result.stdout.trim(), "INTERRUPT-VISTO-OK");
+});
+
 test("send --wait: silence hits the idle timeout, exit 2", async () => {
 	const { agentDir, session } = armedSession();
 	const ctl = runCtl(["send", session.id, "void", "--wait", "--idle-timeout", "1"], agentDir);

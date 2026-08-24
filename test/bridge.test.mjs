@@ -235,6 +235,37 @@ test("attribution: interrupt binds via the next agent_start", async (t) => {
 	assert.equal(bound.id, "int-2");
 });
 
+test("attribution: interrupt on a busy session preempts the bound owner and claims the new turn", async (t) => {
+	const b = await boot(t);
+	b.drop({ id: "old-cmd", action: "prompt", message: "long job" });
+	await b.until((r) => r.type === "accepted" && r.id === "old-cmd");
+	await b.world.fire("input", { source: "extension", text: "long job" });
+	await b.world.fire("agent_start", {}, b.ctx);
+
+	b.drop({ id: "int-cmd", action: "interrupt", message: "drop everything, do X" });
+	await b.until((r) => r.type === "accepted" && r.id === "int-cmd");
+
+	// Live-observed ordering (atomic 0.9.13): the aborted turn ends, the
+	// interrupt's turn starts, THEN the aborted run settles, then the
+	// interrupt's turn ends and settles.
+	await b.world.fire("agent_end", { messages: [] });
+	await b.world.fire("agent_start", {}, b.ctx);
+	await b.world.fire("agent_settled", {}, b.ctx);
+	await b.world.fire("agent_end", {
+		messages: [{ role: "assistant", content: [{ type: "text", text: "INTERRUPT-VISTO-OK" }] }],
+	});
+	await b.world.fire("agent_settled", {}, b.ctx);
+
+	const bound = b.records().find((r) => r.type === "turn_bound" && r.id === "int-cmd");
+	assert.equal(bound?.via, "interrupt", "the interrupt must claim its turn even over a bound owner");
+	const settles = b.records().filter((r) => r.type === "agent_settled");
+	assert.equal(settles.length, 2);
+	assert.equal(settles[0].owner, "old-cmd");
+	assert.equal(settles[0].aborted, true, "the preempted command's settle must say it was aborted");
+	assert.equal(settles[1].owner, "int-cmd", "the reply must be attributed to the interrupt command");
+	assert.equal(settles[1].text, "INTERRUPT-VISTO-OK");
+});
+
 test("workflows: launch detected, settle goes provisional, lifecycle mirrored from entries", async (t) => {
 	const b = await boot(t);
 	const runId = "12345678-abcd-4ef0-9876-1234567890ab";
