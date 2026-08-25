@@ -161,3 +161,10 @@ generation 3 after the run. The bridge mitigates with `RELOAD_SETTLE_MS`
 between the two injections; the durable fix belongs in the engine (await
 in-flight discovery on name resolution, or expose reload completion to
 extensions).
+
+**Status:** the engine fix exists and is submitted upstream for maintainer
+review (branch `fix/workflows-await-inflight-reload` on `bastani-inc/atomic`:
+`ensureWorkflowResourcesLoaded` now awaits an in-flight reload). Keep
+`RELOAD_SETTLE_MS` until the fix ships in a released Atomic and that release
+is the oldest engine this bridge supports; it protects every engine ≤ 0.9.15.
+When dropping it, gate on the Atomic version rather than deleting outright.
