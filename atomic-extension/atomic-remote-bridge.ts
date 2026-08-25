@@ -155,6 +155,19 @@ export default function (pi: ExtensionAPI) {
 	let outboxModeApplied = false;
 	let outboxApproxBytes = -1; // -1 = unknown; measured once, then tracked per append
 	let agentRunning = false;
+	let engineCtx: { isIdle?: () => boolean } | undefined;
+
+	// Single source of truth for busy/idle: the engine's own isIdle() when it
+	// exists, agentRunning only as the fallback. agentRunning drifts when an
+	// agent_settled is missed; trusting it alongside isIdle produced live
+	// status_reports saying idle:true and busy:true at once.
+	const isContended = () => {
+		try {
+			return engineCtx?.isIdle ? !engineCtx.isIdle() : agentRunning;
+		} catch {
+			return agentRunning;
+		}
+	};
 
 	// Attribution state (roadmap #2).
 	const pendingBindings = new Map<string, string>(); // normalized text -> command id
@@ -228,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			fs.writeFileSync(
 				path.join(sessionDir, "heartbeat.json"),
-				JSON.stringify({ ts: Date.now(), enginePid: process.pid, busy: agentRunning }),
+				JSON.stringify({ ts: Date.now(), enginePid: process.pid, busy: isContended() }),
 				{ mode: 0o600 },
 			);
 		} catch {
@@ -317,13 +330,8 @@ export default function (pi: ExtensionAPI) {
 			sessionManager?: { getEntries?: () => unknown[] };
 		},
 	) => {
-		const contended = (() => {
-			try {
-				return ctx.isIdle ? !ctx.isIdle() : agentRunning;
-			} catch {
-				return agentRunning;
-			}
-		})();
+		engineCtx = ctx;
+		const contended = isContended();
 		try {
 			switch (cmd.action) {
 				case "ping":
@@ -335,7 +343,7 @@ export default function (pi: ExtensionAPI) {
 						type: "status_report",
 						id: cmd.id,
 						idle: !contended,
-						busy: agentRunning,
+						busy: contended,
 						pendingMessages: (() => {
 							try {
 								return ctx.hasPendingMessages?.() ?? null;
@@ -517,6 +525,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		stopTimersAndWatcher();
+		engineCtx = ctx as { isIdle?: () => boolean };
 
 		// A session switch (/new, /resume, /fork) reuses this engine process:
 		// everything scoped to the previous session must not leak into this one.
