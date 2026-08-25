@@ -12,7 +12,7 @@ Two control planes. Pick by situation:
 | The user has an Atomic session open in a terminal | **Bridge** (`atomic-ctl.mjs`) |
 | No session is open; a one-shot run is needed | **RPC** (`rpc-run.mjs`) |
 
-## Bridge workflow (protocol v2)
+## Bridge workflow (protocol v3)
 
 1. **Discover**: `node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" list`
    States: `live` (commandable), `stale` (bridge v1 or hung — needs `/reload` in Atomic),
@@ -40,6 +40,40 @@ Two control planes. Pick by situation:
    - `--accept-partial` opts into a reply contaminated by concurrent user input
      (turns exit 6 into exit 0 with a warning); `-v`/`--verbose` traces bridge
      records on stderr.
+   - **Hand off a plan as structure, not prose**: write the plan to a JSON file
+     (`goal`, `constraints`, `acceptance`, `context.files`; ≤ 8 KiB) and attach it
+     with `--plan plan.json` (prompt/follow_up only). The bridge persists it in the
+     session's `plans/` directory and inlines it in the injected message. Prefer
+     this over pasting a plan into the message body whenever the task has
+     acceptance criteria or file references.
+   - `--mode command` dispatches a leading-slash message (e.g. `/workflow reload`)
+     as a real Atomic slash command. Plain `prompt` sends slash text as chat the
+     model may ignore.
+   - `--json` on `send --wait` prints the structured outcome object (same shape as
+     the `outcome` command) instead of the bare reply text.
+
+3b. **Multi-stage plans — privileged path**: generate a workflow TS file
+   (`export default workflow({ name, inputs, outputs, run })`) and run it
+   deterministically:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" run-workflow auto ./my-plan.ts --args "target=main" --wait
+   ```
+   This installs the file into the session's `.atomic/workflows/`, injects
+   `/workflow reload` then `/workflow run <name>`, and binds attribution to the
+   run. `--name <n>` overrides the name (default: file basename, `[a-z0-9-]`).
+   A `workflow_installed` record with `overwrote: true` means an existing
+   workflow file was replaced — mention that to the user.
+
+3c. **Query outcomes after the fact** (the replan loop): any command id can be
+   interrogated later, even after a timeout or on a closed session:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" outcome <target> <command-id>
+   ```
+   JSON answer: `state` is `pending|working|completed|failed|aborted|uncertain|detached`,
+   plus reply `text`, `runs` (with `failedStageId`/`stageName` when a workflow
+   failed), and `planPath`. After exit 2 or 7 from `send --wait`, poll `outcome`
+   instead of resending; on `state: "failed"` with a `failedStageId`, replan
+   from that stage instead of restarting the whole task.
 
 4. **Read the outcome — exit codes are the contract** (do not improvise):
 
@@ -56,7 +90,7 @@ Two control planes. Pick by situation:
 
 5. **Workflows**: if the command makes Atomic launch a workflow, `--wait` follows it to
    its terminal notice (`workflow_lifecycle` records). Never present "Workflow started"
-   text as a final result — that is exactly the failure mode v2 exists to prevent.
+   text as a final result — that is exactly the failure mode the protocol exists to prevent.
 
 6. **Observe live**: `follow <target>` streams outbox records (one JSON per line;
    bounded, 30 s by default — `--for <s>` to change, `--for 0` to stream forever);

@@ -1,8 +1,32 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-08-25
+
+Protocol v3: the plan→execution handoff carries structure instead of prose, and
+execution feedback flows back typed and queryable.
 
 ### Added
+- **Structured plan handoff** — `send --plan <plan.json>` attaches a plan artifact
+  (goal, constraints, acceptance criteria, file references; ≤ 8 KiB) to a
+  `prompt`/`follow_up`. The bridge persists it at
+  `remote-bridge/<sid>/plans/<command-id>.json` and inlines it in the injected
+  message; `accepted` records carry `planPath`.
+- **Deterministic workflow entry** — new `run-workflow <target> <file.ts>
+  [--name <n>] [--args "<a>"]` controller command and `run_workflow` bridge action
+  (command files up to 256 KiB): installs the workflow TS into the session's
+  `.atomic/workflows/`, injects `/workflow reload` then `/workflow run <name>`,
+  binds attribution to the run injection, and reports overwrites
+  (`workflow_installed` with `overwrote`).
+- **Slash-command dispatch** — `send --mode command "/…"` (bridge action
+  `command`) injects with `expandPromptTemplates: true`, so the text dispatches
+  as a real slash command instead of chat the model may or may not obey.
+- **Queryable outcomes** — new `outcome <target> <command-id> [--json]` command
+  replays outbox history (rotated file included, closed sessions included)
+  through the same state machine `--wait` runs live and prints JSON with
+  `state` (`pending|working|completed|failed|aborted|uncertain|detached`),
+  reply text, runs, and `failedStageId`. `send --wait --json` and
+  `run-workflow --wait --json` print the same object, exit codes unchanged.
+
 - **Test suite** (`node --test 'test/*.test.mjs'`, Node ≥ 22, zero dependencies): 72 tests
   covering the controller end-to-end (target resolution, exit-code contract,
   wait-loop state machine, outbox rotation, reattach, prune safety), the bridge
@@ -15,6 +39,20 @@
   to send?" no longer requires a `status` round-trip.
 
 ### Changed
+- **Workflow feedback is typed.** The bridge mirrors the workflow engine's own
+  lifecycle notices (`custom_message` entries, `customType
+  "workflows:lifecycle-notice"`): `workflow_lifecycle` records now carry
+  `scope` (`run`/`stage`), `workflowName`, `status`, and stage fields
+  (`stageId`, `stageName`, `failedStageId`, `error`). `terminal` is true only
+  for run-scope terminal kinds, so a stage completing cannot end a run-level
+  wait. The v2 keyword regex over serialized entries is gone, with its false
+  negatives (exit-7 timeouts) and false positives (assistant text quoting a
+  run id near "completed"). `workflow_started` now reads the workflow tool's
+  structured `result.details.runId` instead of regex-matching a UUID.
+- **Protocol bumped to 3** (`BRIDGE_VERSION` 0.3.0). The controller still
+  delivers v2-shaped commands to protocol-2 sessions; only the v3 features
+  (`--plan`, `--mode command`, `run-workflow`) are refused client-side, before
+  touching the inbox, with the setup + `/reload` hint.
 - **`list` human output gained a column**: busy/idle sits between the state
   and `name=`. Anything parsing the plain-text columns positionally must
   adjust; `list --json` remains the stable machine surface.
@@ -25,6 +63,10 @@
   the explicit `prune` command.
 
 ### Fixed
+- **`status` can no longer report `idle: true` and `busy: true` at once**
+  (observed live). Both fields, the heartbeat `busy` flag, and `accepted.contended`
+  now derive from one source of truth: the engine's `isIdle()` when available,
+  the bridge's own turn tracking only as fallback.
 - **Interrupt replies are now attributed** (reproduced live, twice, on
   atomic 0.9.13). On a busy session, the interrupt's new turn used to start
   while the old command was still bound: the aborted run's late settle

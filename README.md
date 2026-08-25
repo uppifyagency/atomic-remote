@@ -5,12 +5,12 @@
 <br><br>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.1-38bdf8?style=flat-square)](CHANGELOG.md)
-[![Protocol](https://img.shields.io/badge/protocol-v2-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v2-guarantees)
+[![Version](https://img.shields.io/badge/version-0.3.0-38bdf8?style=flat-square)](CHANGELOG.md)
+[![Protocol](https://img.shields.io/badge/protocol-v3-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v3-guarantees)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-4ade80?style=flat-square)](#)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
 
-**[Website](https://atomic-remote.vercel.app)** · **[Install](#install)** · **[Protocol v2](#what-protocol-v2-guarantees)** · **[Design history](ROADMAP.md)**
+**[Website](https://atomic-remote.vercel.app)** · **[Install](#install)** · **[Protocol v3](#what-protocol-v3-guarantees)** · **[Design history](ROADMAP.md)**
 
 </div>
 
@@ -82,9 +82,12 @@ node scripts/atomic-ctl.mjs list [--json] [--all]
 node scripts/atomic-ctl.mjs ping <target>
 node scripts/atomic-ctl.mjs status <target>
 node scripts/atomic-ctl.mjs send <target|auto> "message" \
-    [--mode prompt|steer|follow_up|interrupt] [--wait] \
-    [--idle-timeout <s>] [--timeout <s>] [--message-file <path>] \
-    [--accept-partial] [-v|--verbose]
+    [--mode prompt|steer|follow_up|interrupt|command] [--wait] [--json] \
+    [--plan <plan.json>] [--idle-timeout <s>] [--timeout <s>] \
+    [--message-file <path>] [--accept-partial] [-v|--verbose]
+node scripts/atomic-ctl.mjs run-workflow <target|auto> <file.ts> \
+    [--name <name>] [--args "<args>"] [--wait] [--json]
+node scripts/atomic-ctl.mjs outcome <target> <command-id> [--json]
 node scripts/atomic-ctl.mjs follow <target> [--for <s>]   # default 30s; --for 0 = forever
 node scripts/atomic-ctl.mjs tail <target> [--lines <n>]
 node scripts/atomic-ctl.mjs abort <target>
@@ -100,9 +103,32 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 | `steer` | Redirects the agent between turns of its current run |
 | `follow_up` | Waits until the agent finishes, then delivers |
 | `interrupt` | Aborts the current turn and starts on your message immediately |
+| `command` | Dispatches a leading-slash message as a real slash command (e.g. `/workflow reload`), not chat text |
 
-### What protocol v2 guarantees
+### What protocol v3 guarantees
 
+- **Structured plan handoff.** `send --plan plan.json` attaches a plan artifact
+  (goal, constraints, acceptance criteria, file references) to a `prompt`/`follow_up`.
+  The bridge persists it under the session's `plans/` directory and inlines it in the
+  injected message — the plan crosses the channel as structure, not prose.
+- **Deterministic workflow entry.** `run-workflow file.ts` installs a generated
+  workflow into the session's `.atomic/workflows/`, injects `/workflow reload`, then
+  `/workflow run <name>` — dispatched as real slash commands. Overwriting an existing
+  workflow file is reported (`workflow_installed` with `overwrote: true`), never silent.
+- **Typed workflow feedback.** Lifecycle records mirror the workflow engine's own
+  structured notices (`customType "workflows:lifecycle-notice"`): run and stage scope,
+  workflow name, status, failed stage, error. The v2 keyword regex over serialized
+  entries is gone, and with it both its false negatives (exit-7 timeouts) and its
+  false positives (assistant text quoting a run id near "completed"). Stage events
+  are mirrored but only run-scope terminal kinds end a `--wait`.
+- **Queryable outcomes.** `outcome <target> <command-id>` replays outbox history —
+  closed sessions included — through the same state machine `--wait` runs live, and
+  answers with JSON: `state` (`pending|working|completed|failed|aborted|uncertain|detached`),
+  reply text, runs, failed stage. A wait that timed out (exit 2/7) can always be
+  resolved later without re-sending. `send --wait --json` prints the same object.
+- **One source of truth for busy/idle.** `status` derives both fields from the
+  engine's own `isIdle()`, with the bridge's turn tracking only as fallback — the
+  contradictory `idle:true busy:true` report is unrepresentable.
 - **Attributed replies.** Commands are bound to their turn through Atomic's documented
   `input` event; every record carries an `owner` id. `--wait` concludes on
   `agent_settled` — the documented terminal event — for *your* command, or refuses

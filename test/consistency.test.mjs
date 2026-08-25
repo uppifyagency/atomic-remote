@@ -45,6 +45,9 @@ test("every exit code the controller can produce is documented in the skill and 
 	const ctlSource = read("scripts/atomic-ctl.mjs");
 	const codes = new Set(["1"]);
 	for (const match of ctlSource.matchAll(/fail\((?:[^()]|\([^()]*\))*,\s*(\d)\s*,?\s*\)/g)) codes.add(match[1]);
+	// The outcome tracker carries its exit codes as data ({ code: N }) that the
+	// wait loop later passes to fail(); extract those too.
+	for (const match of ctlSource.matchAll(/code:\s*(\d)\b/g)) codes.add(match[1]);
 	codes.add("0");
 	assert.ok(codes.size >= 8, `expected the full taxonomy, extracted only: ${[...codes].join(",")}`);
 	for (const doc of ["README.md", "skills/atomic-remote/SKILL.md"]) {

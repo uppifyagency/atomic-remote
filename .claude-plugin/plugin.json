@@ -1,7 +1,7 @@
 {
   "name": "atomic-remote",
   "description": "Command running Atomic (by Bastani) sessions from Claude Code: send prompts, steer, interrupt, track workflows, read attributed replies — or run Atomic headless via RPC.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": { "name": "Vlad Vrinceanu" },
   "homepage": "https://github.com/uppifyagency/atomic-remote",
   "repository": "https://github.com/uppifyagency/atomic-remote",

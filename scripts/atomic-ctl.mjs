@@ -30,7 +30,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const EXPECTED_PROTOCOL = 2;
+const EXPECTED_PROTOCOL = 2; // delivery floor: v2 sessions still take v2-shaped commands
+const V3_PROTOCOL = 3; // required for plan/command/run_workflow
+const MAX_PLAN_BYTES = 8 * 1024;
+const MAX_WORKFLOW_SOURCE_BYTES = 200 * 1024; // leaves headroom under the bridge's 256 KiB command cap
 const HEARTBEAT_STALE_MS = 20_000;
 const DEFAULT_IDLE_TIMEOUT_S = 120;
 const POLL_MS = 250;
@@ -230,6 +233,172 @@ function writeCommand(target, payload) {
 	fs.renameSync(tmp, path.join(inbox, name));
 }
 
+// --- outcome tracker: one reducer for live waits and post-hoc queries --------
+// The wait loop and the `outcome` command classify through this same state
+// machine, so a --wait that exited 2 and a later `outcome` cannot disagree.
+
+function createOutcomeTracker(payload, flags) {
+	const isPrompt = ["prompt", "interrupt", "command", "run_workflow"].includes(payload.action);
+	const st = {
+		accepted: false,
+		bound: false,
+		foreignSeen: false,
+		planPath: null,
+		workflowName: null,
+		myRuns: new Set(),
+		runDetail: new Map(), // runId -> last workflow_lifecycle record
+		resolved: null, // { text }
+		failure: null, // { state, code, message, runId?, failedStageId? }
+	};
+
+	// Directives for a live loop: {op:"note"|"resolve"|"fail", ...}. A post-hoc
+	// replay ignores them and reads snapshot() instead.
+	function apply(record) {
+		const out = [];
+		switch (record.type) {
+			case "error":
+				if (record.id === payload.id) {
+					st.failure = { state: "failed", code: 5, message: `Bridge error: ${record.error}` };
+					out.push({ op: "fail", code: 5, message: st.failure.message });
+				}
+				break;
+			case "accepted":
+				if (record.id === payload.id) {
+					st.accepted = true;
+					if (record.planPath) st.planPath = record.planPath;
+					if (record.workflowName) st.workflowName = record.workflowName;
+					if (record.delivered === "steer-fallback") out.push({ op: "note", message: "note: agent busy — delivered as steer" });
+					if (record.contended)
+						out.push({ op: "note", message: "note: session is busy (contended) — attribution may be unreliable" });
+				}
+				break;
+			case "workflow_installed":
+				if (record.id === payload.id && record.overwrote)
+					out.push({ op: "note", message: `note: overwrote existing workflow at ${record.targetPath}` });
+				break;
+			case "turn_bound":
+				if (record.id === payload.id) st.bound = true;
+				break;
+			case "foreign_input":
+				if (st.accepted && !st.bound) {
+					st.foreignSeen = true;
+					if (isPrompt && !flags.acceptPartial) {
+						st.failure = {
+							state: "uncertain",
+							code: 6,
+							message: "Attribution abandoned: concurrent user input in the Atomic session.",
+						};
+						out.push({ op: "fail", code: 6, message: `${st.failure.message}\nInspect manually: tail <target>` });
+					}
+				}
+				break;
+			case "workflow_started":
+				if (record.owner === payload.id) {
+					st.myRuns.add(record.runId);
+					out.push({ op: "note", message: `note: workflow launched (${record.runId}) — waiting for its terminal notice` });
+				}
+				break;
+			case "workflow_lifecycle":
+				if (st.myRuns.has(record.runId)) {
+					st.runDetail.set(record.runId, record);
+					if (record.terminal) {
+						if (record.kind === "completed") {
+							st.resolved = { text: record.text ?? `workflow ${record.runId} completed` };
+							out.push({ op: "resolve", text: st.resolved.text });
+						} else {
+							st.failure = {
+								state: "failed",
+								code: 5,
+								message: `Workflow ${record.runId} ended: ${record.kind}\n${record.text ?? ""}`,
+								runId: record.runId,
+								failedStageId: record.failedStageId ?? null,
+							};
+							out.push({ op: "fail", code: 5, message: st.failure.message });
+						}
+					}
+				}
+				break;
+			case "agent_settled": {
+				if (!st.accepted) break;
+				const owned = record.owner === payload.id;
+				const weaklyOwned =
+					record.owner === null && !st.bound && !isPrompt && !st.foreignSeen && !record.foreignInputSeen;
+				if (!owned && !weaklyOwned) break;
+				if (owned && record.aborted) {
+					st.failure = {
+						state: "aborted",
+						code: 5,
+						message: "The turn for this command was aborted before completing (interrupted).",
+					};
+					out.push({ op: "fail", code: 5, message: st.failure.message });
+					break;
+				}
+				if (owned && record.foreignInputSeen && isPrompt && !flags.acceptPartial) {
+					st.failure = {
+						state: "uncertain",
+						code: 6,
+						message: "Attribution uncertain: the user typed into the Atomic session during your turn.",
+					};
+					out.push({ op: "fail", code: 6, message: `${st.failure.message}\nInspect manually: tail <target>` });
+					break;
+				}
+				if (record.provisional && st.myRuns.size > 0) break; // workflow still running
+				if (record.provisional && Array.isArray(record.pendingWork)) {
+					for (const work of record.pendingWork) if (work.runId) st.myRuns.add(work.runId);
+					out.push({ op: "note", message: "note: turn settled with detached async work — waiting for workflow completion" });
+					break;
+				}
+				if (owned && record.foreignInputSeen)
+					out.push({ op: "note", message: "note: concurrent user input during the turn — reply may reflect it (--accept-partial)" });
+				if (weaklyOwned) out.push({ op: "note", message: "note: weak attribution (steer/follow_up binding is best-effort)" });
+				st.resolved = { text: record.text ?? "(agent settled with no assistant text)" };
+				out.push({ op: "resolve", text: st.resolved.text });
+				break;
+			}
+			default:
+				break;
+		}
+		return out;
+	}
+
+	function snapshot() {
+		const pendingRuns = [...st.myRuns].filter((runId) => !st.runDetail.get(runId)?.terminal);
+		const base = {
+			commandId: payload.id,
+			action: payload.action,
+			...(st.planPath ? { planPath: st.planPath } : {}),
+			...(st.workflowName ? { workflowName: st.workflowName } : {}),
+			runs: [...st.myRuns].map((runId) => {
+				const detail = st.runDetail.get(runId);
+				return {
+					runId,
+					kind: detail?.kind ?? "started",
+					terminal: detail?.terminal ?? false,
+					...(detail?.failedStageId ? { failedStageId: detail.failedStageId } : {}),
+					...(detail?.stageName ? { stageName: detail.stageName } : {}),
+				};
+			}),
+		};
+		if (st.failure) {
+			const { state, code, message, runId, failedStageId } = st.failure;
+			return {
+				...base,
+				state,
+				exitCode: code,
+				text: message,
+				...(runId ? { runId } : {}),
+				...(failedStageId ? { failedStageId } : {}),
+			};
+		}
+		if (st.resolved) return { ...base, state: "completed", exitCode: 0, text: st.resolved.text };
+		if (!st.accepted) return { ...base, state: "pending", exitCode: 2 };
+		if (pendingRuns.length > 0) return { ...base, state: "detached", exitCode: 7, runId: pendingRuns[0] };
+		return { ...base, state: "working", exitCode: 2 };
+	}
+
+	return { apply, snapshot, state: st };
+}
+
 // --- wait loop (roadmap #2, #3, #5) -----------------------------------------
 
 async function waitForOutcome(target, payload, flags) {
@@ -240,13 +409,13 @@ async function waitForOutcome(target, payload, flags) {
 
 	const startedAt = Date.now();
 	let lastActivityAt = Date.now();
-	let accepted = false;
-	let bound = false;
-	let foreignSeen = false;
 	let reattachDeadline = null; // set while waiting for bridge_ready after bridge_closed
 	let closeReason = null;
-	const myRuns = new Set();
-	const isPrompt = payload.action === "prompt" || payload.action === "interrupt";
+	const tracker = createOutcomeTracker(payload, flags);
+	const finish = (code) => {
+		if (flags.json) console.log(JSON.stringify(tracker.snapshot(), null, 2));
+		return code;
+	};
 
 	for (;;) {
 		await sleep(POLL_MS);
@@ -254,112 +423,54 @@ async function waitForOutcome(target, payload, flags) {
 		if (records.length > 0) lastActivityAt = Date.now();
 		for (const record of records) {
 			if (flags.verbose) console.error(`[${record.type}]${record.id ? ` id=${record.id}` : ""}`);
-			switch (record.type) {
-				case "error":
-					if (record.id === payload.id) fail(`Bridge error: ${record.error}`, 5);
-					break;
-				case "pong":
-					if (record.id === payload.id) {
-						if ((record.protocol ?? 1) < EXPECTED_PROTOCOL)
-							console.error(`warning: bridge protocol ${record.protocol ?? 1} — rerun setup + /reload`);
-						console.log("pong");
-						return 0;
-					}
-					break;
-				case "status_report":
-					if (record.id === payload.id) {
-						console.log(JSON.stringify(record, null, 2));
-						return 0;
-					}
-					break;
-				case "accepted":
-					if (record.id === payload.id) {
-						accepted = true;
-						if (payload.action === "abort") {
-							console.log("abort delivered");
-							return 0;
-						}
-						if (record.delivered === "steer-fallback") console.error("note: agent busy — delivered as steer");
-						if (record.contended) console.error("note: session is busy (contended) — attribution may be unreliable");
-					}
-					break;
-				case "turn_bound":
-					if (record.id === payload.id) bound = true;
-					break;
-				case "foreign_input":
-					if (accepted && !bound) {
-						foreignSeen = true;
-						if (isPrompt && !flags.acceptPartial) {
-							fail(
-								"Attribution abandoned: concurrent user input in the Atomic session.\nInspect manually: tail " +
-									target.id.slice(0, 8),
-								6,
-							);
-						}
-					}
-					break;
-				case "workflow_started":
-					if (record.owner === payload.id) {
-						myRuns.add(record.runId);
-						console.error(`note: workflow launched (${record.runId}) — waiting for its terminal notice`);
-					}
-					break;
-				case "workflow_lifecycle":
-					if (myRuns.has(record.runId) && record.terminal) {
-						if (record.kind === "completed") {
-							console.log(record.text ?? `workflow ${record.runId} completed`);
-							return 0;
-						}
-						fail(`Workflow ${record.runId} ended: ${record.kind}\n${record.text ?? ""}`, 5);
-					}
-					break;
-				case "agent_settled": {
-					if (!accepted) break;
-					const owned = record.owner === payload.id;
-					const weaklyOwned =
-						record.owner === null && !bound && !isPrompt && !foreignSeen && !record.foreignInputSeen;
-					if (!owned && !weaklyOwned) break;
-					if (owned && record.aborted) {
-						fail("The turn for this command was aborted before completing (interrupted).", 5);
-					}
-					if (owned && record.foreignInputSeen && isPrompt && !flags.acceptPartial) {
-						fail(
-							"Attribution uncertain: the user typed into the Atomic session during your turn.\nInspect manually: tail " +
-								target.id.slice(0, 8),
-							6,
-						);
-					}
-					if (record.provisional && myRuns.size > 0) break; // workflow still running
-					if (record.provisional && Array.isArray(record.pendingWork)) {
-						for (const work of record.pendingWork) if (work.runId) myRuns.add(work.runId);
-						console.error("note: turn settled with detached async work — waiting for workflow completion");
-						break;
-					}
-					if (owned && record.foreignInputSeen)
-						console.error("note: concurrent user input during the turn — reply may reflect it (--accept-partial)");
-					if (weaklyOwned) console.error("note: weak attribution (steer/follow_up binding is best-effort)");
-					console.log(record.text ?? "(agent settled with no assistant text)");
-					return 0;
+			// Round-trip commands resolve outside the outcome state machine.
+			if (record.type === "pong" && record.id === payload.id) {
+				if ((record.protocol ?? 1) < EXPECTED_PROTOCOL)
+					console.error(`warning: bridge protocol ${record.protocol ?? 1} — rerun setup + /reload`);
+				console.log("pong");
+				return 0;
+			}
+			if (record.type === "status_report" && record.id === payload.id) {
+				console.log(JSON.stringify(record, null, 2));
+				return 0;
+			}
+			if (record.type === "accepted" && record.id === payload.id && payload.action === "abort") {
+				console.log("abort delivered");
+				return 0;
+			}
+			if (record.type === "bridge_ready") {
+				if (reattachDeadline !== null) {
+					console.error(`note: session ${closeReason === "reload" ? "reloaded" : "replaced"} — reattached`);
+					reattachDeadline = null;
+					closeReason = null;
 				}
-				case "bridge_ready":
-					if (reattachDeadline !== null) {
-						console.error(`note: session ${closeReason === "reload" ? "reloaded" : "replaced"} — reattached`);
-						reattachDeadline = null;
-						closeReason = null;
+				continue;
+			}
+			if (record.type === "bridge_closed") {
+				// Don't fail yet: /reload and /new re-arm the same bridge directory.
+				// Keep processing records (a settle may already be in the outbox) and
+				// give bridge_ready a bounded window to show up.
+				reattachDeadline = Date.now() + REATTACH_WINDOW_MS;
+				closeReason = record.reason ?? "quit";
+				continue;
+			}
+			for (const directive of tracker.apply(record)) {
+				if (directive.op === "note") console.error(directive.message);
+				else if (directive.op === "resolve") {
+					if (flags.json) return finish(0);
+					console.log(directive.text);
+					return 0;
+				} else if (directive.op === "fail") {
+					if (flags.json) {
+						console.error(directive.message.replace("tail <target>", `tail ${target.id.slice(0, 8)}`));
+						process.exit(finish(directive.code));
 					}
-					break;
-				case "bridge_closed":
-					// Don't fail yet: /reload and /new re-arm the same bridge directory.
-					// Keep processing records (a settle may already be in the outbox) and
-					// give bridge_ready a bounded window to show up.
-					reattachDeadline = Date.now() + REATTACH_WINDOW_MS;
-					closeReason = record.reason ?? "quit";
-					break;
-				default:
-					break;
+					fail(directive.message.replace("tail <target>", `tail ${target.id.slice(0, 8)}`), directive.code);
+				}
 			}
 		}
 		if (reattachDeadline !== null && Date.now() > reattachDeadline) {
+			if (flags.json) process.exit(finish(5));
 			fail(
 				closeReason === "quit"
 					? "The Atomic session quit before replying."
@@ -369,11 +480,14 @@ async function waitForOutcome(target, payload, flags) {
 		}
 		const idleMs = Date.now() - lastActivityAt;
 		const totalMs = Date.now() - startedAt;
+		const myRuns = tracker.state.myRuns;
 		if (flags.timeoutS > 0 && totalMs > flags.timeoutS * 1000) {
+			if (flags.json) process.exit(finish(myRuns.size > 0 ? 7 : 2));
 			if (myRuns.size > 0) fail(`Absolute timeout; workflow still running: ${[...myRuns].join(", ")}`, 7);
 			fail(`Absolute timeout after ${flags.timeoutS}s — check later: tail ${target.id.slice(0, 8)}`, 2);
 		}
 		if (idleMs > flags.idleTimeoutS * 1000) {
+			if (flags.json) process.exit(finish(myRuns.size > 0 ? 7 : 2));
 			if (myRuns.size > 0)
 				fail(
 					`No bridge activity for ${flags.idleTimeoutS}s; detached workflow still running: ${[...myRuns].join(", ")}`,
@@ -396,6 +510,9 @@ const FLAG_SPECS = {
 	"--timeout": { key: "timeoutS", takesValue: true, numeric: true },
 	"--accept-partial": { key: "acceptPartial", takesValue: false },
 	"--message-file": { key: "messageFile", takesValue: true },
+	"--plan": { key: "planFile", takesValue: true },
+	"--name": { key: "workflowName", takesValue: true },
+	"--args": { key: "workflowArgs", takesValue: true },
 	"--lines": { key: "lines", takesValue: true, numeric: true },
 	"--for": { key: "forS", takesValue: true, numeric: true },
 	"--older-than": { key: "olderThanDays", takesValue: true, numeric: true },
@@ -414,6 +531,9 @@ function parseArgs(args) {
 		timeoutS: 0,
 		acceptPartial: false,
 		messageFile: null,
+		planFile: null,
+		workflowName: null,
+		workflowArgs: null,
 		lines: 20,
 		forS: null, // null = command default (DEFAULT_FOLLOW_S); 0 = unbounded
 		olderThanDays: PRUNE_DEFAULT_DAYS,
@@ -438,8 +558,8 @@ function parseArgs(args) {
 			rest.push(arg);
 		}
 	}
-	if (!["prompt", "steer", "follow_up", "interrupt"].includes(flags.mode)) {
-		fail(`Invalid --mode: ${flags.mode} (use prompt|steer|follow_up|interrupt)`);
+	if (!["prompt", "steer", "follow_up", "interrupt", "command"].includes(flags.mode)) {
+		fail(`Invalid --mode: ${flags.mode} (use prompt|steer|follow_up|interrupt|command)`);
 	}
 	return { rest, flags };
 }
@@ -457,9 +577,18 @@ Commands:
   ping <target>                Round-trip liveness + protocol check
   status <target>              Ask the bridge for idle/busy, pending workflows
   send <target> <message...>   Inject a command; message "-" reads stdin
-       [--mode prompt|steer|follow_up|interrupt] [--wait]
-       [--idle-timeout <s>=120] [--timeout <s>] [--accept-partial]
-       [--message-file <path>] [-v]
+       [--mode prompt|steer|follow_up|interrupt|command] [--wait] [--json]
+       [--plan <plan.json>] [--idle-timeout <s>=120] [--timeout <s>]
+       [--accept-partial] [--message-file <path>] [-v]
+       --plan attaches a structured plan artifact (prompt/follow_up, proto 3)
+       --mode command dispatches a leading-slash message as a real slash command
+  run-workflow <target> <file.ts> [--name <n>] [--args "<a>"] [--wait] [--json]
+       Install the workflow into the session's .atomic/workflows/, reload,
+       and run it deterministically (proto 3)
+  outcome <target> <command-id> [--json]
+       Query a past command's result from outbox history (safe to poll;
+       works on closed sessions): state pending|working|completed|failed|
+       aborted|uncertain|detached, text, runs, failedStageId
   tail <target> [--lines <n>]  Print recent outbox records (works on closed sessions)
   follow <target> [--for <s>]  Stream outbox records (default 30s; --for 0 = forever)
   abort <target>               Abort the session's current turn
@@ -521,8 +650,34 @@ async function main() {
 			if (!message || message.trim().length === 0) {
 				fail('Usage: send <target|auto> <message...> (or --message-file <path>, or "-" for stdin)');
 			}
+			if (flags.mode === "command" && !message.trim().startsWith("/")) {
+				fail("--mode command requires a message starting with / (a slash command)");
+			}
+			let plan = null;
+			if (flags.planFile) {
+				if (!["prompt", "follow_up"].includes(flags.mode)) fail("--plan is only allowed with --mode prompt|follow_up");
+				let parsed;
+				try {
+					parsed = JSON.parse(fs.readFileSync(flags.planFile, "utf8"));
+				} catch (error) {
+					fail(`--plan ${flags.planFile}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) fail("--plan must be a JSON object");
+				if (Buffer.byteLength(JSON.stringify(parsed)) > MAX_PLAN_BYTES) fail(`--plan exceeds ${MAX_PLAN_BYTES} bytes`);
+				plan = parsed;
+			}
 			const target = resolveTarget(token);
-			const payload = { id: newCommandId(), action: flags.mode, message };
+			// v3-only features are refused client-side, before anything reaches the
+			// inbox: a v2 bridge rejects unknown keys with a confusing error from
+			// the other side, and a silently degraded plan handoff is the lossy
+			// handoff this protocol exists to eliminate.
+			if ((plan || flags.mode === "command") && (target.protocol ?? 1) < V3_PROTOCOL) {
+				fail(
+					`${plan ? "--plan" : "--mode command"} requires bridge protocol ${V3_PROTOCOL} (session runs ${target.protocol ?? 1}).\nUpdate it: /atomic-remote:setup, then /reload inside Atomic.`,
+					5,
+				);
+			}
+			const payload = { id: newCommandId(), action: flags.mode, message, ...(plan ? { plan } : {}) };
 			if (!flags.wait) {
 				writeCommand(target, payload);
 				console.log(`Sent ${flags.mode} to ${target.name ?? target.id} (command id ${payload.id}).`);
@@ -531,6 +686,78 @@ async function main() {
 			}
 			process.exit(await waitForOutcome(target, payload, flags));
 			break;
+		}
+		case "run-workflow": {
+			const [token, workflowFile] = rest;
+			if (!workflowFile) fail('Usage: run-workflow <target|auto> <file.ts> [--name <name>] [--args "<args>"] [--wait]');
+			let workflowSource;
+			try {
+				workflowSource = fs.readFileSync(workflowFile, "utf8");
+			} catch (error) {
+				fail(`run-workflow: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			if (Buffer.byteLength(workflowSource) > MAX_WORKFLOW_SOURCE_BYTES) {
+				fail(`run-workflow: source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`);
+			}
+			const workflowName = flags.workflowName ?? path.basename(workflowFile).replace(/\.(ts|js|mjs|cjs)$/, "");
+			if (!/^[a-z0-9-]{1,64}$/.test(workflowName)) {
+				fail(`run-workflow: invalid workflow name "${workflowName}" (use [a-z0-9-]{1,64}, or pass --name)`);
+			}
+			const target = resolveTarget(token);
+			if ((target.protocol ?? 1) < V3_PROTOCOL) {
+				fail(
+					`run-workflow requires bridge protocol ${V3_PROTOCOL} (session runs ${target.protocol ?? 1}).\nUpdate it: /atomic-remote:setup, then /reload inside Atomic.`,
+					5,
+				);
+			}
+			const payload = {
+				id: newCommandId(),
+				action: "run_workflow",
+				workflowName,
+				workflowSource,
+				...(flags.workflowArgs ? { args: flags.workflowArgs } : {}),
+			};
+			if (!flags.wait) {
+				writeCommand(target, payload);
+				console.log(`Sent run_workflow ${workflowName} to ${target.name ?? target.id} (command id ${payload.id}).`);
+				console.log(`Follow with: follow ${String(target.id).slice(0, 8)} · or query later: outcome ${String(target.id).slice(0, 8)} ${payload.id}`);
+				return;
+			}
+			process.exit(await waitForOutcome(target, payload, flags));
+			break;
+		}
+		case "outcome": {
+			const [token, commandId] = rest;
+			if (!commandId) fail("Usage: outcome <target> <command-id> [--json]");
+			const target = resolveTarget(token, { anyState: true });
+			// Post-hoc: replay the full history (rotated file first) through the
+			// same reducer the wait loop uses, then read its verdict.
+			const tracker = createOutcomeTracker({ id: commandId, action: "prompt" }, flags);
+			let seen = false;
+			for (const file of [path.join(target.dir, "outbox.1.jsonl"), path.join(target.dir, "outbox.jsonl")]) {
+				let content;
+				try {
+					content = fs.readFileSync(file, "utf8");
+				} catch {
+					continue;
+				}
+				for (const line of content.split("\n")) {
+					const trimmed = line.trim();
+					if (!trimmed) continue;
+					let record;
+					try {
+						record = JSON.parse(trimmed);
+					} catch {
+						continue;
+					}
+					if (record.id === commandId || record.owner === commandId) seen = true;
+					tracker.apply(record);
+				}
+			}
+			if (!seen) fail(`No outbox record mentions command ${commandId} in session ${target.id}.`, 4);
+			const outcome = tracker.snapshot();
+			console.log(JSON.stringify(outcome, null, 2));
+			return;
 		}
 		case "tail": {
 			const target = resolveTarget(rest[0], { anyState: true });
