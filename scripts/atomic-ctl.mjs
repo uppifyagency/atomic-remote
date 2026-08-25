@@ -241,6 +241,7 @@ function createOutcomeTracker(payload, flags) {
 	const isPrompt = ["prompt", "interrupt", "command", "run_workflow"].includes(payload.action);
 	const st = {
 		accepted: false,
+		action: payload.action,
 		bound: false,
 		foreignSeen: false,
 		planPath: null,
@@ -265,6 +266,7 @@ function createOutcomeTracker(payload, flags) {
 			case "accepted":
 				if (record.id === payload.id) {
 					st.accepted = true;
+					if (typeof record.action === "string") st.action = record.action;
 					if (record.planPath) st.planPath = record.planPath;
 					if (record.workflowName) st.workflowName = record.workflowName;
 					if (record.delivered === "steer-fallback") out.push({ op: "note", message: "note: agent busy — delivered as steer" });
@@ -365,7 +367,7 @@ function createOutcomeTracker(payload, flags) {
 		const pendingRuns = [...st.myRuns].filter((runId) => !st.runDetail.get(runId)?.terminal);
 		const base = {
 			commandId: payload.id,
-			action: payload.action,
+			action: st.action,
 			...(st.planPath ? { planPath: st.planPath } : {}),
 			...(st.workflowName ? { workflowName: st.workflowName } : {}),
 			runs: [...st.myRuns].map((runId) => {

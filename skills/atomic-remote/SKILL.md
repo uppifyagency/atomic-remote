@@ -59,7 +59,7 @@ Two control planes. Pick by situation:
    node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" run-workflow auto ./my-plan.ts --args "target=main" --wait
    ```
    This installs the file into the session's `.atomic/workflows/`, injects
-   `/workflow reload` then `/workflow run <name>`, and binds attribution to the
+   `/workflow reload` then `/workflow <name>`, and binds attribution to the
    run. `--name <n>` overrides the name (default: file basename, `[a-z0-9-]`).
    A `workflow_installed` record with `overwrote: true` means an existing
    workflow file was replaced — mention that to the user.

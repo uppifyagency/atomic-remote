@@ -113,7 +113,7 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
   injected message — the plan crosses the channel as structure, not prose.
 - **Deterministic workflow entry.** `run-workflow file.ts` installs a generated
   workflow into the session's `.atomic/workflows/`, injects `/workflow reload`, then
-  `/workflow run <name>` — dispatched as real slash commands. Overwriting an existing
+  `/workflow <name>` — dispatched as real slash commands. Overwriting an existing
   workflow file is reported (`workflow_installed` with `overwrote: true`), never silent.
 - **Typed workflow feedback.** Lifecycle records mirror the workflow engine's own
   structured notices (`customType "workflows:lifecycle-notice"`): run and stage scope,

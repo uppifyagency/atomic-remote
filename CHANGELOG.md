@@ -14,7 +14,7 @@ execution feedback flows back typed and queryable.
 - **Deterministic workflow entry** — new `run-workflow <target> <file.ts>
   [--name <n>] [--args "<a>"]` controller command and `run_workflow` bridge action
   (command files up to 256 KiB): installs the workflow TS into the session's
-  `.atomic/workflows/`, injects `/workflow reload` then `/workflow run <name>`,
+  `.atomic/workflows/`, injects `/workflow reload` then `/workflow <name>`,
   binds attribution to the run injection, and reports overwrites
   (`workflow_installed` with `overwrote`).
 - **Slash-command dispatch** — `send --mode command "/…"` (bridge action

@@ -147,3 +147,17 @@ Sintesi di 30 proposte, filtrate contro la verifica API (doc ufficiale Atomic) e
 ## 4. La modifica da fare per prima
 
 **Il fix identità/liveness (TOP 5 #1), e in particolare togliere il `rmSync` da `listSessions()`.** Non perché sia il difetto più visibile — quello è il `--wait` che ha stampato «Workflow avviato: `<id>`» come risultato — ma perché è l'unico che *distrugge dati e li distrugge silenziosamente durante un'operazione di sola lettura*. `atomic-ctl.mjs:54-60` esegue `rmSync` recursive dentro un `list`, decidendo la vita sulla base di `process.kill(meta.pid, 0)` su un pid che la doc di Atomic dichiara esplicitamente transitorio: dopo ogni sostituzione dell'engine child — watchdog o crash, entrambi documentati con il loro messaggio — il primo `list` cancella la directory di una sessione perfettamente viva, portandosi via outbox, comandi pendenti e il target su cui gli script dell'utente puntano. Ogni altro item della roadmap scrive in quella directory: l'attribuzione, il progress stream, la storia durevole, l'handshake di versione. Costruirli sopra una directory che un comando innocuo può cancellare significa doverli debuggare due volte. Il fatto che questo stesso fix ricorra in sei proposte indipendenti su trenta è il segnale più forte prodotto da tutta la valutazione: è la fondazione, e va posata prima.
+
+## Upstream gap (atomic 0.9.15, filed from the v3 e2e)
+
+`/workflow reload` followed immediately by `/workflow <name>` can run the
+pre-reload module: `pi.sendUserMessage` returns before command execution
+(fire-and-forget binding), workflow name resolution does not await an
+in-flight reload (`ensureWorkflowResourcesLoaded` waits only while no
+discovery exists at all), and a reload report can reflect a coalesced warmup
+that read the file before it was rewritten. Observed live: overwrite → reload
+"generation 2" → run executes the old module → the real reload lands as
+generation 3 after the run. The bridge mitigates with `RELOAD_SETTLE_MS`
+between the two injections; the durable fix belongs in the engine (await
+in-flight discovery on name resolution, or expose reload completion to
+extensions).

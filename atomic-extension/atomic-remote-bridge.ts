@@ -66,6 +66,13 @@ const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BATCH_PER_TICK = 32;
 const OUTBOX_MAX_BYTES = 8 * 1024 * 1024;
 const INBOX_SAFETY_SCAN_MS = 10_000; // backstop only; fs.watch is the primary trigger
+// Engine race, observed live (atomic 0.9.15): pi.sendUserMessage is
+// fire-and-forget, and workflow name resolution does not await an in-flight
+// reload (ensureWorkflowResourcesLoaded only waits while no discovery exists
+// at all), so a run injected right after /workflow reload can execute the
+// pre-reload module. No completion signal reaches extensions; a bounded settle
+// between the two injections is the only lever this side of the boundary.
+const RELOAD_SETTLE_MS = 5_000;
 const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
@@ -263,6 +270,11 @@ export default function (pi: ExtensionAPI) {
 	// Workflow tracking (roadmap #3).
 	const knownRuns = new Map<string, { owner: string | null; terminal: boolean }>();
 	let entryCursor = 0;
+	// A slash-launched run never passes through the model's workflow tool (no
+	// tool_execution_end) and a handled slash command emits no input event, so
+	// run_workflow attribution binds via the run's own "started" notice, matched
+	// by workflow name.
+	let pendingWorkflowLaunch: { owner: string; workflowName: string } | null = null;
 
 	// Serial command queue (roadmap #4).
 	let chain: Promise<void> = Promise.resolve();
@@ -377,6 +389,16 @@ export default function (pi: ExtensionAPI) {
 				// First sight via a lifecycle notice (tool event missed, or the run
 				// was started by the user): register it so status can report it.
 				run = { owner: null, terminal: false };
+				if (
+					pendingWorkflowLaunch !== null &&
+					details.kind === "started" &&
+					details.scope !== "stage" &&
+					details.workflowName === pendingWorkflowLaunch.workflowName
+				) {
+					run.owner = pendingWorkflowLaunch.owner;
+					pendingWorkflowLaunch = null;
+					emit({ type: "workflow_started", runId, owner: run.owner });
+				}
 				knownRuns.set(runId, run);
 			}
 			const scope = details.scope === "stage" ? "stage" : "run";
@@ -524,8 +546,15 @@ export default function (pi: ExtensionAPI) {
 					// Overwriting a hand-written workflow must be visible, never silent.
 					emit({ type: "workflow_installed", id: cmd.id, workflowName: cmd.workflowName, targetPath, overwrote });
 					await Promise.resolve(pi.sendUserMessage("/workflow reload", { expandPromptTemplates: true }));
-					const runText = `/workflow run ${cmd.workflowName}${cmd.args ? ` ${cmd.args}` : ""}`;
-					bind(runText);
+					await new Promise((resolve) => setTimeout(resolve, RELOAD_SETTLE_MS));
+					// Registered command syntax is `/workflow <name> [key=value…]` — there
+					// is no `run` subcommand on the slash surface (that word is the tool
+					// action vocabulary). Verified live: `/workflow run x` errors with
+					// "Workflow not found: run".
+					const runText = `/workflow ${cmd.workflowName}${cmd.args ? ` ${cmd.args}` : ""}`;
+					// A handled slash command emits no input event: attribution comes
+					// from the "started" lifecycle notice, not from a text binding.
+					pendingWorkflowLaunch = { owner: cmd.id, workflowName: cmd.workflowName };
 					await Promise.resolve(pi.sendUserMessage(runText, { expandPromptTemplates: true }));
 					emit({ type: "accepted", id: cmd.id, action: "run_workflow", workflowName: cmd.workflowName, contended });
 					return;

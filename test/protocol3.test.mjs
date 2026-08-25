@@ -104,11 +104,21 @@ test("run_workflow: installs the TS, reloads, runs, and binds to the run injecti
 		b.world.sent.map((s) => [s.message, s.options?.expandPromptTemplates === true]),
 		[
 			["/workflow reload", true],
-			["/workflow run demo-flow target=main", true],
+			["/workflow demo-flow target=main", true],
 		],
 	);
-	await b.world.fire("input", { source: "extension", text: "/workflow run demo-flow target=main" });
-	await b.until((r) => r.type === "turn_bound" && r.id === "wf-run-1");
+	// A handled slash command emits no input event; attribution binds via the
+	// run's own "started" notice, matched on workflow name.
+	const runId = "12121212-abcd-4ef0-9876-343434345656";
+	b.ctx.entries.push({
+		type: "custom_message",
+		customType: "workflows:lifecycle-notice",
+		content: "Workflow demo-flow started",
+		details: { kind: "started", scope: "run", runId, workflowName: "demo-flow", status: "running" },
+	});
+	await b.world.fire("agent_start", {}, b.ctx);
+	const started = await b.until((r) => r.type === "workflow_started" && r.runId === runId);
+	assert.equal(started.owner, "wf-run-1", "the slash-launched run must be attributed to the command");
 });
 
 test("run_workflow: overwriting an existing workflow file is reported", async (t) => {
