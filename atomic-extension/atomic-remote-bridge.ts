@@ -12,9 +12,25 @@
  *
  * Command file shape (id is REQUIRED, [A-Za-z0-9_-]{1,64}):
  *   { "id": "…", "action": "ping" | "status" | "abort" | "prompt" | "steer"
- *                        | "follow_up" | "interrupt", "message": "…" }
+ *                        | "follow_up" | "interrupt" | "command", "message": "…",
+ *     "plan"?: {…} }                      // prompt/follow_up only, ≤ 8 KiB
+ *   { "id": "…", "action": "run_workflow", "workflowName": "…",
+ *     "workflowSource": "…", "args"?: "…" }  // its command file may reach 256 KiB
  *
- * Protocol guarantees (v2):
+ * Protocol additions (v3):
+ *   - "command" injects a leading-slash message with expandPromptTemplates:true,
+ *     so it dispatches as a real slash command instead of chat text
+ *   - a "plan" object is persisted to <sessionDir>/plans/<id>.json and inlined
+ *     into the injected message (structured handoff, not prose)
+ *   - "run_workflow" installs a workflow TS into <cwd>/.atomic/workflows/,
+ *     injects /workflow reload then /workflow run <name> (deterministic entry);
+ *     emits workflow_installed {targetPath, overwrote}
+ *   - workflow lifecycle is mirrored structurally from custom_message entries
+ *     (customType "workflows:lifecycle-notice"): workflow_lifecycle records now
+ *     carry scope/workflowName/status/stage fields; terminal only for run scope
+ *   - status_report busy/idle come from one source of truth (engine isIdle)
+ *
+ * Protocol guarantees (v2, unchanged):
  *   - every command gets an ack record (accepted / error), even degenerate input
  *   - commands are processed serially, in filename order, at-least-once
  *     (rename to .processing before injection; leftovers surface as errors)
@@ -38,29 +54,47 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.2.1";
-const PROTOCOL = 2;
+const BRIDGE_VERSION = "0.3.0";
+const PROTOCOL = 3;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const MAX_COMMAND_BYTES = 64 * 1024;
+// run_workflow carries a generated TS source, not a chat message; it gets its own cap.
+const MAX_WORKFLOW_COMMAND_BYTES = 256 * 1024;
+const MAX_PLAN_BYTES = 8 * 1024;
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BATCH_PER_TICK = 32;
 const OUTBOX_MAX_BYTES = 8 * 1024 * 1024;
 const INBOX_SAFETY_SCAN_MS = 10_000; // backstop only; fs.watch is the primary trigger
 const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-const RUN_ID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
 // Controller filenames are <ts:14>-<seq:3>-<id>.json; anything else yields id=null.
 const PROCESSING_ID_PATTERN = /^\d{14}-\d{3}-([A-Za-z0-9_-]{1,64})\.json\.processing$/;
-const WORKFLOW_TERMINAL_KINDS = ["completed", "failed", "blocked", "quit"] as const;
-const WORKFLOW_LIFECYCLE_KINDS = [...WORKFLOW_TERMINAL_KINDS, "paused", "resumed"] as const;
+const WORKFLOW_LIFECYCLE_CUSTOM_TYPE = "workflows:lifecycle-notice";
+// terminal is true only for run-scope terminal kinds: a stage completing must not
+// end a controller's wait for the whole run.
+const WORKFLOW_TERMINAL_KINDS: readonly string[] = ["completed", "failed", "blocked", "quit"];
 
 type MessagelessAction = "ping" | "status" | "abort";
-type MessageAction = "prompt" | "steer" | "follow_up" | "interrupt";
+type MessageAction = "prompt" | "steer" | "follow_up" | "interrupt" | "command";
 
 type BridgeCommand =
 	| { action: MessagelessAction; id: string }
-	| { action: MessageAction; id: string; message: string };
+	| { action: MessageAction; id: string; message: string; plan?: Record<string, unknown> }
+	| { action: "run_workflow"; id: string; workflowName: string; workflowSource: string; args?: string };
+
+interface WorkflowLifecycleDetails {
+	kind?: string;
+	scope?: string;
+	runId?: string;
+	workflowName?: string;
+	status?: string;
+	stageId?: string;
+	stageName?: string;
+	failedStageId?: string;
+	error?: string;
+}
 
 interface RejectedCommand {
 	rejected: true;
@@ -82,8 +116,9 @@ interface MessageLike {
 const agentDir = process.env.ATOMIC_CODING_AGENT_DIR ?? path.join(os.homedir(), ".atomic", "agent");
 const bridgeRoot = path.join(agentDir, "remote-bridge");
 
-const MESSAGE_ACTIONS: readonly string[] = ["prompt", "steer", "follow_up", "interrupt"];
-const ALL_ACTIONS: readonly string[] = ["ping", "status", "abort", ...MESSAGE_ACTIONS];
+const MESSAGE_ACTIONS: readonly string[] = ["prompt", "steer", "follow_up", "interrupt", "command"];
+const PLAN_ACTIONS: readonly string[] = ["prompt", "follow_up"];
+const ALL_ACTIONS: readonly string[] = ["ping", "status", "abort", "run_workflow", ...MESSAGE_ACTIONS];
 
 function normalizeForBinding(text: string): string {
 	return text.replace(/\s+/g, " ").trim().slice(0, 2000);
@@ -121,7 +156,34 @@ function parseCommand(raw: string): BridgeCommand | RejectedCommand {
 	if (typeof action !== "string" || !ALL_ACTIONS.includes(action)) {
 		return { rejected: true, id, reason: `unknown action: ${String(action)}` };
 	}
-	const knownKeys = ["id", "action", "message"];
+	if (action === "run_workflow") {
+		const wfKnownKeys = ["id", "action", "workflowName", "workflowSource", "args"];
+		const wfUnknownKeys = Object.keys(record).filter((key) => !wfKnownKeys.includes(key));
+		const workflowName = record.workflowName;
+		if (typeof workflowName !== "string" || !WORKFLOW_NAME_PATTERN.test(workflowName)) {
+			return {
+				rejected: true,
+				id,
+				reason: "run_workflow requires workflowName ([a-z0-9-]{1,64})",
+				unknownKeys: wfUnknownKeys,
+			};
+		}
+		const workflowSource = record.workflowSource;
+		if (typeof workflowSource !== "string" || workflowSource.trim().length === 0) {
+			return { rejected: true, id, reason: "run_workflow requires a non-empty workflowSource", unknownKeys: wfUnknownKeys };
+		}
+		const args = record.args;
+		if (args !== undefined && (typeof args !== "string" || args.includes("\n") || args.length > 2000)) {
+			return {
+				rejected: true,
+				id,
+				reason: "run_workflow args must be a single-line string of at most 2000 chars",
+				unknownKeys: wfUnknownKeys,
+			};
+		}
+		return { action: "run_workflow", id, workflowName, workflowSource, ...(args !== undefined ? { args } : {}) };
+	}
+	const knownKeys = ["id", "action", "message", "plan"];
 	const unknownKeys = Object.keys(record).filter((key) => !knownKeys.includes(key));
 	if (MESSAGE_ACTIONS.includes(action)) {
 		const message = record.message;
@@ -139,7 +201,27 @@ function parseCommand(raw: string): BridgeCommand | RejectedCommand {
 		if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(message)) {
 			return { rejected: true, id, reason: "message contains control characters", unknownKeys };
 		}
-		return { action: action as MessageAction, id, message };
+		if (action === "command" && !trimmed.startsWith("/")) {
+			return { rejected: true, id, reason: "command requires a message starting with /", unknownKeys };
+		}
+		const plan = record.plan;
+		if (plan !== undefined) {
+			if (!PLAN_ACTIONS.includes(action)) {
+				return { rejected: true, id, reason: `plan is only allowed on ${PLAN_ACTIONS.join("/")}`, unknownKeys };
+			}
+			if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
+				return { rejected: true, id, reason: "plan must be a JSON object", unknownKeys };
+			}
+			if (Buffer.byteLength(JSON.stringify(plan)) > MAX_PLAN_BYTES) {
+				return { rejected: true, id, reason: `plan exceeds ${MAX_PLAN_BYTES} bytes`, unknownKeys };
+			}
+		}
+		return {
+			action: action as MessageAction,
+			id,
+			message,
+			...(plan !== undefined ? { plan: plan as Record<string, unknown> } : {}),
+		};
 	}
 	return { action: action as MessagelessAction, id };
 }
@@ -267,8 +349,12 @@ export default function (pi: ExtensionAPI) {
 
 	const hasPendingRuns = () => [...knownRuns.values()].some((run) => !run.terminal);
 
+	// Structural mirroring: @bastani/workflows appends its lifecycle notices as
+	// custom_message entries with typed details. Reading those replaces the v2
+	// regex-over-JSON.stringify heuristic, whose false negatives degraded to
+	// exit-7 timeouts and whose false positives fired on assistant text quoting
+	// a runId near the word "completed".
 	const scanEntriesForWorkflows = (ctx: { sessionManager?: { getEntries?: () => unknown[] } }) => {
-		if (!hasPendingRuns()) return;
 		let entries: unknown[];
 		try {
 			entries = ctx.sessionManager?.getEntries?.() ?? [];
@@ -276,34 +362,41 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		for (; entryCursor < entries.length; entryCursor++) {
-			let serialized: string;
-			try {
-				serialized = JSON.stringify(entries[entryCursor]);
-			} catch {
-				continue;
+			const entry = entries[entryCursor] as {
+				type?: string;
+				customType?: string;
+				details?: WorkflowLifecycleDetails;
+				content?: unknown;
+			} | null;
+			if (entry?.type !== "custom_message" || entry.customType !== WORKFLOW_LIFECYCLE_CUSTOM_TYPE) continue;
+			const details = entry.details;
+			if (!details || typeof details.runId !== "string" || typeof details.kind !== "string") continue;
+			const runId = details.runId.toLowerCase();
+			let run = knownRuns.get(runId);
+			if (!run) {
+				// First sight via a lifecycle notice (tool event missed, or the run
+				// was started by the user): register it so status can report it.
+				run = { owner: null, terminal: false };
+				knownRuns.set(runId, run);
 			}
-			// Best-effort inference: lifecycle notices are recognized by runId plus a
-			// terminal keyword in an entry that also mentions "workflow". A false
-			// negative degrades to exit 7 at timeout; this guard narrows the false
-			// positives (e.g. an assistant message quoting the runId near "completed").
-			if (!/workflow/i.test(serialized)) continue;
-			for (const [runId, run] of knownRuns) {
-				if (run.terminal || !serialized.includes(runId)) continue;
-				const kind = WORKFLOW_LIFECYCLE_KINDS.find((candidate) =>
-					new RegExp(`\\b${candidate}\\b`, "i").test(serialized),
-				);
-				if (!kind) continue;
-				const terminal = (WORKFLOW_TERMINAL_KINDS as readonly string[]).includes(kind);
-				if (terminal) run.terminal = true;
-				emit({
-					type: "workflow_lifecycle",
-					runId,
-					kind,
-					terminal,
-					owner: run.owner,
-					text: serialized.slice(0, 2000),
-				});
-			}
+			const scope = details.scope === "stage" ? "stage" : "run";
+			const terminal = scope === "run" && WORKFLOW_TERMINAL_KINDS.includes(details.kind);
+			if (terminal) run.terminal = true;
+			emit({
+				type: "workflow_lifecycle",
+				runId,
+				kind: details.kind,
+				terminal,
+				owner: run.owner,
+				scope,
+				workflowName: details.workflowName ?? null,
+				status: details.status ?? null,
+				...(details.stageId ? { stageId: details.stageId } : {}),
+				...(details.stageName ? { stageName: details.stageName } : {}),
+				...(details.failedStageId ? { failedStageId: details.failedStageId } : {}),
+				...(details.error ? { error: String(details.error).slice(0, 2000) } : {}),
+				text: typeof entry.content === "string" ? entry.content.slice(0, 2000) : null,
+			});
 		}
 	};
 
@@ -332,6 +425,23 @@ export default function (pi: ExtensionAPI) {
 	) => {
 		engineCtx = ctx;
 		const contended = isContended();
+		let bindingKey: string | null = null;
+		const bind = (text: string) => {
+			bindingKey = normalizeForBinding(text);
+			pendingBindings.set(bindingKey, cmd.id);
+		};
+		// A plan travels the channel as structure and lands twice: as a durable
+		// artifact under plans/ and inline in the injected message, so the agent
+		// needs no extra turn to read it.
+		const composeMessage = (message: string, plan: Record<string, unknown> | undefined): string => {
+			if (!plan || !sessionDir) return message;
+			const plansDir = path.join(sessionDir, "plans");
+			const planPath = path.join(plansDir, `${cmd.id}.json`);
+			fs.mkdirSync(plansDir, { recursive: true, mode: 0o700 });
+			fs.writeFileSync(planPath, JSON.stringify(plan, null, 2), { mode: 0o600 });
+			return `${message}\n\nPlan artifact (atomic-remote/plan@1, persisted at ${planPath}):\n${JSON.stringify(plan, null, 2)}`;
+		};
+		const planPathOf = () => (sessionDir ? path.join(sessionDir, "plans", `${cmd.id}.json`) : null);
 		try {
 			switch (cmd.action) {
 				case "ping":
@@ -366,26 +476,60 @@ export default function (pi: ExtensionAPI) {
 					emit({ type: "accepted", id: cmd.id, action: "abort", contended });
 					return;
 				case "prompt": {
-					pendingBindings.set(normalizeForBinding(cmd.message), cmd.id);
+					const injected = composeMessage(cmd.message, cmd.plan);
+					bind(injected);
+					const planExtra = cmd.plan ? { planPath: planPathOf() } : {};
 					try {
-						await Promise.resolve(pi.sendUserMessage(cmd.message));
-						emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended });
+						await Promise.resolve(pi.sendUserMessage(injected));
+						emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended, ...planExtra });
 					} catch {
-						await Promise.resolve(pi.sendUserMessage(cmd.message, { deliverAs: "steer" }));
-						emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "steer-fallback", contended });
+						await Promise.resolve(pi.sendUserMessage(injected, { deliverAs: "steer" }));
+						emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "steer-fallback", contended, ...planExtra });
 					}
 					return;
 				}
 				case "steer":
-					pendingBindings.set(normalizeForBinding(cmd.message), cmd.id);
+					bind(cmd.message);
 					await Promise.resolve(pi.sendUserMessage(cmd.message, { deliverAs: "steer" }));
 					emit({ type: "accepted", id: cmd.id, action: "steer", delivered: "steer", contended });
 					return;
-				case "follow_up":
-					pendingBindings.set(normalizeForBinding(cmd.message), cmd.id);
-					await Promise.resolve(pi.sendUserMessage(cmd.message, { deliverAs: "followUp" }));
-					emit({ type: "accepted", id: cmd.id, action: "follow_up", delivered: "followUp", contended });
+				case "follow_up": {
+					const injected = composeMessage(cmd.message, cmd.plan);
+					bind(injected);
+					await Promise.resolve(pi.sendUserMessage(injected, { deliverAs: "followUp" }));
+					emit({
+						type: "accepted",
+						id: cmd.id,
+						action: "follow_up",
+						delivered: "followUp",
+						contended,
+						...(cmd.plan ? { planPath: planPathOf() } : {}),
+					});
 					return;
+				}
+				case "command":
+					// expandPromptTemplates is load-bearing: without it the injected
+					// slash command is plain chat text for the model, not a dispatch.
+					bind(cmd.message);
+					await Promise.resolve(pi.sendUserMessage(cmd.message, { expandPromptTemplates: true }));
+					emit({ type: "accepted", id: cmd.id, action: "command", delivered: "command", contended });
+					return;
+				case "run_workflow": {
+					const cwd = String(readMeta()?.cwd ?? process.cwd());
+					const workflowDir = path.join(cwd, ".atomic", "workflows");
+					fs.mkdirSync(workflowDir, { recursive: true });
+					const targetPath = path.join(workflowDir, `${cmd.workflowName}.ts`);
+					const overwrote = fs.existsSync(targetPath);
+					fs.writeFileSync(targetPath, cmd.workflowSource, { mode: 0o600 });
+					// Overwriting a hand-written workflow must be visible, never silent.
+					emit({ type: "workflow_installed", id: cmd.id, workflowName: cmd.workflowName, targetPath, overwrote });
+					await Promise.resolve(pi.sendUserMessage("/workflow reload", { expandPromptTemplates: true }));
+					const runText = `/workflow run ${cmd.workflowName}${cmd.args ? ` ${cmd.args}` : ""}`;
+					bind(runText);
+					await Promise.resolve(pi.sendUserMessage(runText, { expandPromptTemplates: true }));
+					emit({ type: "accepted", id: cmd.id, action: "run_workflow", workflowName: cmd.workflowName, contended });
+					return;
+				}
 				case "interrupt":
 					interruptPending = cmd.id;
 					await Promise.resolve(
@@ -399,9 +543,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} catch (error) {
 			if (cmd.action === "interrupt" && interruptPending === cmd.id) interruptPending = null;
-			if (cmd.action !== "ping" && cmd.action !== "status" && cmd.action !== "abort") {
-				pendingBindings.delete(normalizeForBinding(cmd.message));
-			}
+			if (bindingKey !== null) pendingBindings.delete(bindingKey);
 			emit({ type: "error", id: cmd.id, error: error instanceof Error ? error.message : String(error) });
 		}
 	};
@@ -423,7 +565,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const stat = fs.fstatSync(fd);
 				if (!stat.isFile()) rejectReason = "not a regular file";
-				else if (stat.size > MAX_COMMAND_BYTES) rejectReason = `command exceeds ${MAX_COMMAND_BYTES} bytes`;
+				else if (stat.size > MAX_WORKFLOW_COMMAND_BYTES)
+					rejectReason = `command exceeds ${MAX_WORKFLOW_COMMAND_BYTES} bytes`;
 				else {
 					const buffer = Buffer.alloc(Number(stat.size));
 					fs.readSync(fd, buffer, 0, buffer.length, 0);
@@ -441,6 +584,22 @@ export default function (pi: ExtensionAPI) {
 				fs.rmSync(processing, { force: true });
 			} catch {}
 			return;
+		}
+		if (Buffer.byteLength(raw) > MAX_COMMAND_BYTES) {
+			// Only run_workflow earns the larger cap: it ships a TS source, not chat.
+			let action: unknown;
+			try {
+				action = (JSON.parse(raw) as Record<string, unknown>).action;
+			} catch {
+				action = null;
+			}
+			if (action !== "run_workflow") {
+				emit({ type: "error", id: null, error: `command exceeds ${MAX_COMMAND_BYTES} bytes`, file: path.basename(file) });
+				try {
+					fs.rmSync(processing, { force: true });
+				} catch {}
+				return;
+			}
 		}
 		const parsed = parseCommand(raw);
 		if ("rejected" in parsed) {
@@ -714,16 +873,22 @@ export default function (pi: ExtensionAPI) {
 		const toolName = (event as { toolName?: string }).toolName;
 		const isError = (event as { isError?: boolean }).isError;
 		if (toolName !== "workflow" || isError) return;
-		let serialized: string;
-		try {
-			serialized = JSON.stringify((event as { result?: unknown }).result ?? "");
-		} catch {
+		// The workflow tool returns { content, details } where details carries the
+		// structured runId; no serialization or UUID regex involved.
+		const result = (event as { result?: { details?: { runId?: unknown } } }).result;
+		const rawRunId = result?.details?.runId;
+		if (typeof rawRunId !== "string" || rawRunId.length === 0) return;
+		const runId = rawRunId.toLowerCase();
+		const existing = knownRuns.get(runId);
+		if (existing) {
+			if (existing.owner === null && activeOwner !== null) {
+				// Registered first via a lifecycle notice: the tool result is the
+				// attribution authority, so claim it for the active command.
+				existing.owner = activeOwner;
+				emit({ type: "workflow_started", runId, owner: activeOwner });
+			}
 			return;
 		}
-		const match = serialized.match(RUN_ID_PATTERN);
-		if (!match) return;
-		const runId = match[0].toLowerCase();
-		if (knownRuns.has(runId)) return;
 		knownRuns.set(runId, { owner: activeOwner, terminal: false });
 		emit({ type: "workflow_started", runId, owner: activeOwner });
 	});
@@ -746,6 +911,7 @@ export default function (pi: ExtensionAPI) {
 		sessionDir = undefined;
 		inboxDir = undefined;
 		outboxPath = undefined;
+		engineCtx = undefined;
 	});
 
 	pi.registerCommand("remote-name", {

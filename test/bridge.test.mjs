@@ -47,13 +47,13 @@ test("session_start: registers the session dir, meta, heartbeat, bridge_ready", 
 	const b = await boot(t);
 	const meta = JSON.parse(fs.readFileSync(path.join(b.dir, "meta.json"), "utf8"));
 	assert.equal(meta.status, "live");
-	assert.equal(meta.protocol, 2);
+	assert.equal(meta.protocol, 3);
 	assert.equal(meta.sessionId, b.sessionId);
 	const heartbeat = JSON.parse(fs.readFileSync(path.join(b.dir, "heartbeat.json"), "utf8"));
 	assert.ok(Date.now() - heartbeat.ts < 5000);
 	assert.equal(heartbeat.busy, false);
 	const ready = b.records().find((r) => r.type === "bridge_ready");
-	assert.equal(ready.protocol, 2);
+	assert.equal(ready.protocol, 3);
 	assert.ok(b.world.registered.has("remote-name"));
 });
 
@@ -98,7 +98,7 @@ test("ping and status answer without touching the agent", async (t) => {
 	const b = await boot(t);
 	b.drop({ id: "cmd-ping-1", action: "ping" });
 	const pong = await b.until((r) => r.type === "pong" && r.id === "cmd-ping-1");
-	assert.equal(pong.protocol, 2);
+	assert.equal(pong.protocol, 3);
 	b.drop({ id: "cmd-st-1", action: "status" });
 	const report = await b.until((r) => r.type === "status_report" && r.id === "cmd-st-1");
 	assert.equal(report.busy, false);
@@ -276,7 +276,7 @@ test("workflows: launch detected, settle goes provisional, lifecycle mirrored fr
 	await b.world.fire("tool_execution_end", {
 		toolName: "workflow",
 		isError: false,
-		result: { content: `Workflow run started: ${runId}` },
+		result: { content: [{ type: "text", text: "Workflow run started" }], details: { runId, status: "running", action: "run" } },
 	});
 	const started = await b.until((r) => r.type === "workflow_started");
 	assert.equal(started.runId, runId);
@@ -287,7 +287,12 @@ test("workflows: launch detected, settle goes provisional, lifecycle mirrored fr
 	assert.equal(settle.provisional, true);
 	assert.deepEqual(settle.pendingWork, [{ kind: "workflow", runId }]);
 
-	b.ctx.entries.push({ type: "custom", text: `workflow ${runId} completed: all stages green` });
+	b.ctx.entries.push({
+		type: "custom_message",
+		customType: "workflows:lifecycle-notice",
+		content: `Workflow demo completed`,
+		details: { kind: "completed", scope: "run", runId, workflowName: "demo", status: "completed" },
+	});
 	await b.world.fire("agent_start", {}, b.ctx);
 	const lifecycle = b.records().find((r) => r.type === "workflow_lifecycle");
 	assert.equal(lifecycle.runId, runId);
