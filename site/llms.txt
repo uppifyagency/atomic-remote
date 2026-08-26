@@ -1,0 +1,47 @@
+# atomic-remote
+
+> A Claude Code plugin that turns any Atomic (by Bastani) terminal session into a
+> remotely-commandable agent. Claude Code plans; Atomic executes; replies come back
+> attributed and typed. Zero runtime dependencies, strictly local file transport,
+> official Atomic APIs only. Current version: 0.3.1 (bridge protocol v3).
+
+## What it does
+
+- Send prompts, steering messages, follow-ups and attributed interrupts to a running
+  Atomic session (`atomic-ctl send`, modes: prompt | steer | follow_up | interrupt | command).
+- Attach a structured plan artifact (goal, constraints, acceptance criteria, file
+  references) to a prompt with `--plan`.
+- Install and deterministically run an executable workflow file (`run-workflow`),
+  following the run to its terminal lifecycle notice.
+- Detect a workflow run that is awaiting human input and answer it from Claude Code
+  (`answer <target> <run-id> <text>`); exit code 7 distinguishes running from awaiting input.
+- Query the outcome of any past command (`outcome`), replaying durable history through
+  the same state machine the live wait uses.
+- Discover sessions (`list`), check liveness/busyness via a 5-second heartbeat
+  (`status`, `ping`), stream events live (`follow`) or read them later (`tail`).
+- Validate slash-command dispatch against the session's real command surface
+  (`getCommands()`), refusing unknown commands with the available names.
+
+## Guarantees (protocol v3)
+
+- Attributed replies: commands bind to their turn via Atomic's documented `input`
+  event; every record carries an owner id and a monotonic `seq`; waits conclude on
+  `agent_settled`. Bindings are TTL-bounded; concurrent human typing yields exit 6
+  instead of someone else's answer.
+- Typed exit codes 0-7 (reply / usage / timeout / no session / bad target / error /
+  attribution uncertain / detached async work).
+- Local-only security model: no ports, no daemons, no network; 0700 directories,
+  0600 files, symlink-refusing ingestion, size caps, fail-closed inbox.
+
+## Links
+
+- [GitHub repository](https://github.com/uppifyagency/atomic-remote): source, README, install
+- [CHANGELOG](https://github.com/uppifyagency/atomic-remote/blob/main/CHANGELOG.md): release notes per version
+- [ROADMAP / design history](https://github.com/uppifyagency/atomic-remote/blob/main/ROADMAP.md): adversarial review cycles, accepted designs, motivated rejections
+- [Atomic by Bastani](https://github.com/bastani-inc/atomic): the terminal coding agent this plugin commands
+
+## Install
+
+1. `claude plugin marketplace add uppifyagency/atomic-remote`
+2. `claude plugin install atomic-remote@atomic-remote`
+3. In Claude Code: `/atomic-remote:setup`, then `/reload` inside the Atomic session.

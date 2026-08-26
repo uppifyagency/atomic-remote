@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://atomic-remote.vercel.app/sitemap.xml

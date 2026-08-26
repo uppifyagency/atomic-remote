@@ -38,6 +38,18 @@ test("version strings in source headers and README track plugin.json", () => {
 	}
 });
 
+test("the landing page tracks plugin.json and the current protocol", () => {
+	// The site shipped 0.3.1 while still selling "protocol v2 · bridge v0.2.1":
+	// same drift class as the headers above, so it gets the same pin.
+	const plugin = JSON.parse(read(".claude-plugin/plugin.json")).version;
+	const protocol = read("atomic-extension/atomic-remote-bridge.ts").match(/^const PROTOCOL = (\d+);$/m)[1];
+	const site = read("site/index.html");
+	assert.ok(site.includes(`"softwareVersion": "${plugin}"`), `site JSON-LD softwareVersion must be ${plugin}`);
+	assert.ok(site.includes(`bridge v${plugin} active`), `site install step must teach the current activation line (v${plugin})`);
+	assert.ok(site.includes(`protocol v${protocol}`), `site hero tag must name the current protocol (v${protocol})`);
+	assert.ok(!/protocol v2\b|bridge v0\.2\./.test(site), "site still sells a stale protocol/bridge version");
+});
+
 test("every controller flag the docs teach actually exists", () => {
 	const ctlSource = read("scripts/atomic-ctl.mjs");
 	const ctlFlags = new Set([...ctlSource.matchAll(/"(--[a-z-]+)":/g)].map((m) => m[1]));
