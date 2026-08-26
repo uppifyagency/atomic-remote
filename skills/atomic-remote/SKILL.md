@@ -25,6 +25,11 @@ Two control planes. Pick by situation:
    bridge-side answer). If `idle: false`, or the later `accepted` record reports
    `contended: true`, do NOT trust attribution blindly — prefer `follow` to watch,
    or `--mode steer` to cooperate with the running work instead of racing it.
+   `status <target> --commands` also lists the session's slash-command surface
+   (what `--mode command` may dispatch). When the project enables
+   `statusFile: true` in its workflow config, `status` merges a `workflowStatus`
+   section read from `.atomic/workflows/status.json` — the only place
+   `awaiting_input` runs are visible.
 
 3. **Send**:
    ```bash
@@ -48,7 +53,9 @@ Two control planes. Pick by situation:
      acceptance criteria or file references.
    - `--mode command` dispatches a leading-slash message (e.g. `/workflow reload`)
      as a real Atomic slash command. Plain `prompt` sends slash text as chat the
-     model may ignore.
+     model may ignore. An unknown command is refused by the bridge (error
+     record; exit 5 under `--wait`) with the available names — check the
+     surface first with `status <target> --commands`.
    - `--json` on `send --wait` prints the structured outcome object (same shape as
      the `outcome` command) instead of the bare reply text.
 
@@ -86,11 +93,24 @@ Two control planes. Pick by situation:
    | 4 | Target not found or ambiguous | Fix the target: show the listed candidates, pick or ask — do NOT suggest reinstalling |
    | 5 | Bridge/run error (incl. failed workflow) | Report the error verbatim |
    | 6 | Attribution uncertain (user typed concurrently) | Report NOTHING as Atomic's reply; inspect with `tail` |
-   | 7 | Workflow still running detached (run id printed) | Report the run id and that work continues; check later with `follow`/`tail` — do NOT present intermediate text as the result |
+   | 7 | Workflow still running detached (run id printed) | Report the run id and that work continues; check later with `follow`/`tail` — do NOT present intermediate text as the result. If the message names a run awaiting human input, unblock it with `answer` |
 
 5. **Workflows**: if the command makes Atomic launch a workflow, `--wait` follows it to
    its terminal notice (`workflow_lifecycle` records). Never present "Workflow started"
    text as a final result — that is exactly the failure mode the protocol exists to prevent.
+   Long silent runs stay alive through mirrored `workflow_heartbeat` records
+   (one per run every ~15 min), which also reset `--idle-timeout`.
+
+5b. **A run waiting on a human is NOT "still working"**: a workflow paused on a
+   question is invisible to the bridge by design (no main-chat notice). When
+   exit 7 or `outcome` reports `awaitingInput: true` for a run (via the
+   project's statusFile), unblock it instead of waiting:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" answer <target> <run-id> "the answer"
+   ```
+   `answer` injects a follow_up instructing the agent to deliver the answer
+   through the workflow tool (`send` with `delivery: "answer"`). The run id
+   must be the full 36-character UUID.
 
 6. **Observe live**: `follow <target>` streams outbox records (one JSON per line;
    bounded, 30 s by default — `--for <s>` to change, `--for 0` to stream forever);

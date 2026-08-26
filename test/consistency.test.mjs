@@ -17,6 +17,27 @@ test("the version is the same in plugin.json, the bridge, the README badge, and 
 	assert.equal(changelog, plugin, "latest CHANGELOG section vs plugin.json");
 });
 
+test("version strings in source headers and README track plugin.json", () => {
+	// 0.3.0 shipped with "atomic-ctl v2" headers and a README teaching
+	// "bridge v0.2.1 active": nothing pinned those strings. Now the drift is a
+	// failing test instead of a review instruction.
+	const plugin = JSON.parse(read(".claude-plugin/plugin.json")).version;
+	const ctl = read("scripts/atomic-ctl.mjs");
+	const bridge = read("atomic-extension/atomic-remote-bridge.ts");
+	const readme = read("README.md");
+	const protocol = bridge.match(/^const PROTOCOL = (\d+);$/m)[1];
+	assert.ok(
+		(ctl.match(new RegExp(`atomic-ctl v${plugin.replaceAll(".", "\\.")}`, "g")) ?? []).length >= 2,
+		`ctl header and USAGE must both say "atomic-ctl v${plugin}"`,
+	);
+	assert.match(bridge, new RegExp(`atomic-remote bridge v${plugin.replaceAll(".", "\\.")} —`), "bridge header version");
+	assert.ok(readme.includes(`bridge v${plugin} active`), `README must teach the current activation line (v${plugin})`);
+	assert.ok(readme.includes(`protocol v${protocol}`), `README must name the current protocol (v${protocol})`);
+	for (const [file, content] of [["scripts/atomic-ctl.mjs", ctl], ["atomic-extension/atomic-remote-bridge.ts", bridge]]) {
+		assert.ok(!/atomic-ctl v2\b|bridge v2\b/.test(content), `${file} still carries a stale v2 header`);
+	}
+});
+
 test("every controller flag the docs teach actually exists", () => {
 	const ctlSource = read("scripts/atomic-ctl.mjs");
 	const ctlFlags = new Set([...ctlSource.matchAll(/"(--[a-z-]+)":/g)].map((m) => m[1]));

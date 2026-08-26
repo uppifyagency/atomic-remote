@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.3.1] - 2026-08-26
+
+Attribution hardening, human-in-the-loop visibility, and honest replay
+(ROADMAP TOP 5). The protocol stays 3: every addition (`seq`,
+`workflow_heartbeat`, `include`, the `answer` command) is additive, and v2/v3.0
+sessions keep working unchanged.
+
+### Added
+- **Human-in-the-loop visibility and unblock** — a workflow run paused on a
+  human question produces no main-chat notice by design, so it used to look
+  like "still working". Now: `status` merges a `workflowStatus` section read
+  from the project's `.atomic/workflows/status.json` (when the project enables
+  `statusFile: true`), exit-7 messages name run(s) `awaiting human input` and
+  the unblock path, `outcome`/`--json` snapshots mark those runs with
+  `awaitingInput: true`, and the new `answer <target> <run-id> <text>` command
+  injects a follow_up instructing the agent to deliver the answer via the
+  workflow tool (`send` with `delivery: "answer"`). New
+  `/atomic-remote:answer` command doc.
+- **Workflow heartbeat mirroring** — `workflows:workflow-heartbeat` cards are
+  mirrored as `workflow_heartbeat` records (at most one per run per heartbeat
+  interval, 15 min default), so a long silent run keeps resetting
+  `--idle-timeout` instead of timing out as "stuck".
+- **Verified command surface** — `send --mode command` now validates the slash
+  name against `pi.getCommands()`: an unknown command is refused with the
+  available names (first 20) instead of degrading to chat text the model may
+  ignore. `status --commands` (bridge: `include: ["commands"]`) lists the
+  session's slash-command surface. Hosts without `getCommands` stay permissive.
+- **Total order on the outbox** — every record now carries a strictly
+  increasing `seq`. Readers dedupe on it (two same-millisecond `foreign_input`
+  records no longer collapse); records from older bridges fall back to the
+  composite key.
+- **`interruptAbortMessage`** — a remote interrupt now replaces the generic
+  abort result in the model's context with
+  `interrupted by atomic-remote command <id>`, so the transcript says why the
+  turn died.
+
+### Changed
+- **Two-lane command queue** — `ping`/`status`/`abort` are handled immediately
+  instead of queued behind injection commands; previously a `run_workflow`'s
+  5 s reload settle (and anything else on the serial chain) delayed them past
+  the controller's 10 s round-trip timeout. Injection commands stay strictly
+  serial.
+- **`tail` reads the rotated generation** (`outbox.1.jsonl`) like `outcome`
+  always did; history no longer vanishes from `tail` at the 8 MiB rotation.
+- **`outcome` replays honestly** — the reducer derives prompt-ness from the
+  action the `accepted` record carries instead of a hardcoded `"prompt"`: a
+  completed steer/follow_up now replays as `completed` (was `working`/exit 2)
+  and innocuous foreign input no longer poisons non-prompt replays into
+  `uncertain`. The replay also dedupes records with the reader's key.
+- **Durable entry cursor** — the workflow mirror persists the last scanned
+  entry id in `meta.json` (`lastEntryId`); a `/reload` resumes the scan instead
+  of re-emitting the whole mirrored history into the outbox. In-flight runs are
+  persisted alongside the cursor (`pendingRuns`) and rebuilt by the fresh
+  instance, so a reload mid-run neither empties `pendingWorkflows` nor lets a
+  wait settle non-provisionally while the run is still alive (found in review).
+- **Slash names from `getCommands()` are normalized** — a leading `/` in an
+  advertised name no longer makes a valid `--mode command` dispatch look
+  unknown (found in review).
+- **`status --commands` against a pre-0.3.1 bridge warns** — when the report
+  comes back without a `commands` field the controller says the bridge ignores
+  `include` and suggests setup + `/reload`, instead of silently printing a
+  report that looks complete (found in review).
+- **Delivery guard** — the controller re-reads `meta.json` at write time and
+  refuses (exit 3) a session marked `closed`, instead of recreating an inbox
+  nobody will ever read while its heartbeat still looks fresh.
+
+### Fixed
+- **`pendingWorkflowLaunch` could not be disarmed** (attribution leak,
+  worst-in-class): it survived `/new`, `/resume`, `/fork` and failed launch
+  injections, so the next same-named run — even one the user launched by
+  hand — was attributed to a dead command. Now: cleared on session switch,
+  cleared when the launch injection throws, and expired after 60 s with a
+  typed `workflow_launch_expired` record naming the command.
+- **Unclaimed text bindings lived forever**: a binding whose injection never
+  produced an `input` event (e.g. a handled slash command) could capture a
+  future identical turn. Bindings now expire after 10 min and the table is
+  capped at 32 (oldest evicted); both paths emit a typed `binding_expired`
+  record (`reason: "ttl" | "evicted"`). Deliberately not an `error`: a queued
+  follow_up can legitimately outlive the TTL, and failing a possibly-live
+  `--wait` with a spurious exit 5 would be worse than the old hang. The
+  armed-launch expiry (`workflow_launch_expired`) is a non-error note for the
+  same reason (a cold-start admission can be slow); both still disarm the
+  state, which is what prevents the misattribution.
+- **Preemption misattribution window**: when the aborted run's late
+  `agent_end` landed after the interrupt's `agent_start`, the aborted settle
+  was attributed to the interrupt owner (exit 0 on someone else's text). The
+  settle now also checks the engine's own `isIdle()`: a settle arriving while
+  the engine is still busy belongs to the preempted run.
+- Doc drift: `atomic-ctl` header/usage and the bridge header said "v2", the
+  README said `bridge v0.2.1 active` and "protocol v2". All track 0.3.1/v3
+  now, and the consistency suite pins these strings so the drift is a failing
+  test next time.
+
 ## [0.3.0] - 2026-08-25
 
 Protocol v3: the plan→execution handoff carries structure instead of prose, and

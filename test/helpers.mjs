@@ -120,7 +120,7 @@ export function runScript(script, args, { env = process.env, timeoutMs = 20_000,
 
 // --- bridge-side world (imports the real extension module) -------------------
 
-export function makeFakePi({ sendUserMessage, sendMessage, sessionName } = {}) {
+export function makeFakePi({ sendUserMessage, sendMessage, sessionName, commands } = {}) {
 	const handlers = new Map();
 	const world = {
 		sent: [],
@@ -142,6 +142,9 @@ export function makeFakePi({ sendUserMessage, sendMessage, sessionName } = {}) {
 			registerCommand(name, definition) {
 				world.registered.set(name, definition);
 			},
+			// Real pi always exposes getCommands(); pass `commands` to model a
+			// session's slash surface, omit it to model a degraded host.
+			...(commands ? { getCommands: () => commands } : {}),
 		},
 		async fire(event, payload = {}, ctx = {}) {
 			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);

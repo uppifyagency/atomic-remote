@@ -1,5 +1,5 @@
 /**
- * atomic-remote bridge v2 — Atomic-side half of the atomic-remote Claude Code plugin.
+ * atomic-remote bridge v0.3.1 — Atomic-side half of the atomic-remote Claude Code plugin.
  *
  * Install into ~/.atomic/agent/extensions/ (the plugin's /atomic-remote:setup command
  * does this), then run /reload inside the Atomic session.
@@ -23,17 +23,19 @@
  *   - a "plan" object is persisted to <sessionDir>/plans/<id>.json and inlined
  *     into the injected message (structured handoff, not prose)
  *   - "run_workflow" installs a workflow TS into <cwd>/.atomic/workflows/,
- *     injects /workflow reload then /workflow run <name> (deterministic entry);
+ *     injects /workflow reload then /workflow <name> (deterministic entry);
  *     emits workflow_installed {targetPath, overwrote}
  *   - workflow lifecycle is mirrored structurally from custom_message entries
  *     (customType "workflows:lifecycle-notice"): workflow_lifecycle records now
  *     carry scope/workflowName/status/stage fields; terminal only for run scope
  *   - status_report busy/idle come from one source of truth (engine isIdle)
  *
- * Protocol guarantees (v2, unchanged):
+ * Protocol guarantees (v2, unchanged unless noted):
  *   - every command gets an ack record (accepted / error), even degenerate input
- *   - commands are processed serially, in filename order, at-least-once
- *     (rename to .processing before injection; leftovers surface as errors)
+ *   - injection commands are processed serially, in filename order,
+ *     at-least-once (rename to .processing before injection; leftovers surface
+ *     as errors); since 0.3.1 the control actions ping/status/abort are
+ *     handled immediately instead of queued behind injections
  *   - agent records carry an `owner` command id when attribution is known
  *   - `agent_settled` is the terminal record for a turn, not `agent_end`
  *   - an interrupt preempts a bound owner: it claims the next turn, and the
@@ -54,7 +56,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.3.0";
+const BRIDGE_VERSION = "0.3.1";
 const PROTOCOL = 3;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -64,21 +66,38 @@ const MAX_WORKFLOW_COMMAND_BYTES = 256 * 1024;
 const MAX_PLAN_BYTES = 8 * 1024;
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_BATCH_PER_TICK = 32;
-const OUTBOX_MAX_BYTES = 8 * 1024 * 1024;
 const INBOX_SAFETY_SCAN_MS = 10_000; // backstop only; fs.watch is the primary trigger
+// Test seam: suites shrink the settle and TTL windows to keep the suite fast;
+// production never sets these variables.
+const envMs = (name: string, fallback: number): number => {
+	const value = Number(process.env[name]);
+	return Number.isFinite(value) && value > 0 ? value : fallback;
+};
 // Engine race, observed live (atomic 0.9.15): pi.sendUserMessage is
 // fire-and-forget, and workflow name resolution does not await an in-flight
 // reload (ensureWorkflowResourcesLoaded only waits while no discovery exists
 // at all), so a run injected right after /workflow reload can execute the
 // pre-reload module. No completion signal reaches extensions; a bounded settle
 // between the two injections is the only lever this side of the boundary.
-const RELOAD_SETTLE_MS = 5_000;
+// The upstream fix (branch fix/workflows-await-inflight-reload) is submitted;
+// drop this only when the oldest supported Atomic release ships it.
+const RELOAD_SETTLE_MS = envMs("ATOMIC_REMOTE_RELOAD_SETTLE_MS", 5_000);
+// A binding or armed launch that nothing ever claimed is a misattribution in
+// waiting: expire it loudly instead of letting it capture a future turn.
+const BINDING_TTL_MS = envMs("ATOMIC_REMOTE_BINDING_TTL_MS", 600_000);
+const BINDING_CAP = 32;
+const LAUNCH_TTL_MS = envMs("ATOMIC_REMOTE_LAUNCH_TTL_MS", 60_000);
+const OUTBOX_MAX_BYTES = envMs("ATOMIC_REMOTE_OUTBOX_MAX_BYTES", 8 * 1024 * 1024);
 const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
 // Controller filenames are <ts:14>-<seq:3>-<id>.json; anything else yields id=null.
 const PROCESSING_ID_PATTERN = /^\d{14}-\d{3}-([A-Za-z0-9_-]{1,64})\.json\.processing$/;
 const WORKFLOW_LIFECYCLE_CUSTOM_TYPE = "workflows:lifecycle-notice";
+// Heartbeat cards arrive at most once per heartbeatIntervalMinutes (15 min
+// default) per run: mirroring them keeps the outbox low-cardinality while
+// feeding the controller's idle timeout during long silent runs.
+const WORKFLOW_HEARTBEAT_CUSTOM_TYPE = "workflows:workflow-heartbeat";
 // terminal is true only for run-scope terminal kinds: a stage completing must not
 // end a controller's wait for the whole run.
 const WORKFLOW_TERMINAL_KINDS: readonly string[] = ["completed", "failed", "blocked", "quit"];
@@ -87,7 +106,7 @@ type MessagelessAction = "ping" | "status" | "abort";
 type MessageAction = "prompt" | "steer" | "follow_up" | "interrupt" | "command";
 
 type BridgeCommand =
-	| { action: MessagelessAction; id: string }
+	| { action: MessagelessAction; id: string; include?: readonly string[] }
 	| { action: MessageAction; id: string; message: string; plan?: Record<string, unknown> }
 	| { action: "run_workflow"; id: string; workflowName: string; workflowSource: string; args?: string };
 
@@ -124,6 +143,10 @@ const agentDir = process.env.ATOMIC_CODING_AGENT_DIR ?? path.join(os.homedir(), 
 const bridgeRoot = path.join(agentDir, "remote-bridge");
 
 const MESSAGE_ACTIONS: readonly string[] = ["prompt", "steer", "follow_up", "interrupt", "command"];
+// Control lane: actions that inject nothing into the conversation. They are
+// handled immediately instead of queued, so a status or abort never waits
+// behind an injection command (run_workflow alone sleeps RELOAD_SETTLE_MS).
+const CONTROL_ACTIONS: readonly string[] = ["ping", "status", "abort"];
 const PLAN_ACTIONS: readonly string[] = ["prompt", "follow_up"];
 const ALL_ACTIONS: readonly string[] = ["ping", "status", "abort", "run_workflow", ...MESSAGE_ACTIONS];
 
@@ -230,7 +253,35 @@ function parseCommand(raw: string): BridgeCommand | RejectedCommand {
 			...(plan !== undefined ? { plan: plan as Record<string, unknown> } : {}),
 		};
 	}
+	// Optional opt-in sections for status; unknown values are dropped so a
+	// newer controller degrades to a plain report instead of an error.
+	const include = record.include;
+	if (include !== undefined) {
+		if (!Array.isArray(include) || include.some((value) => typeof value !== "string")) {
+			return { rejected: true, id, reason: "include must be an array of strings" };
+		}
+		const known = (include as string[]).filter((value) => value === "commands");
+		return { action: action as MessagelessAction, id, ...(known.length > 0 ? { include: known } : {}) };
+	}
 	return { action: action as MessagelessAction, id };
+}
+
+// The slash surface pi.getCommands() advertises; null when the host cannot
+// say (then command dispatch stays permissive rather than refusing blind).
+function knownCommandNames(pi: unknown): string[] | null {
+	try {
+		const list = (pi as { getCommands?: () => unknown }).getCommands?.();
+		if (!Array.isArray(list) || list.length === 0) return null;
+		const names = list
+			.map((command) => (command as { name?: unknown } | null)?.name)
+			.filter((name): name is string => typeof name === "string")
+			// SlashCommandInfo names are documented without the slash, but the
+			// advertised forms are written "/name" in prose: accept either shape.
+			.map((name) => (name.startsWith("/") ? name.slice(1) : name));
+		return names.length > 0 ? names : null;
+	} catch {
+		return null;
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -243,6 +294,12 @@ export default function (pi: ExtensionAPI) {
 	let workflowTimer: ReturnType<typeof setInterval> | undefined;
 	let outboxModeApplied = false;
 	let outboxApproxBytes = -1; // -1 = unknown; measured once, then tracked per append
+	// Total order across rotations and engine restarts: a millisecond base makes
+	// a replacement instance's first seq larger than anything the old one wrote,
+	// as long as the old instance emitted fewer records than the milliseconds it
+	// lived (an outbox is low-cardinality by design; >1000 records/s sustained
+	// would break this bound before it broke anything else).
+	let seqCounter = Date.now();
 	let agentRunning = false;
 	let engineCtx: { isIdle?: () => boolean } | undefined;
 
@@ -259,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// Attribution state (roadmap #2).
-	const pendingBindings = new Map<string, string>(); // normalized text -> command id
+	const pendingBindings = new Map<string, { id: string; at: number }>(); // normalized text -> pending owner
 	let interruptPending: string | null = null;
 	let activeOwner: string | null = null;
 	let preemptedOwner: string | null = null; // owner whose turn an interrupt aborted
@@ -270,11 +327,40 @@ export default function (pi: ExtensionAPI) {
 	// Workflow tracking (roadmap #3).
 	const knownRuns = new Map<string, { owner: string | null; terminal: boolean }>();
 	let entryCursor = 0;
+	// Durable cursor: the id of the last scanned entry, persisted in meta.json.
+	// Entry ids are stable, so a /reload resumes where the previous extension
+	// instance stopped instead of re-emitting the whole mirrored history.
+	let lastEntryId: string | null = null;
 	// A slash-launched run never passes through the model's workflow tool (no
 	// tool_execution_end) and a handled slash command emits no input event, so
 	// run_workflow attribution binds via the run's own "started" notice, matched
 	// by workflow name.
-	let pendingWorkflowLaunch: { owner: string; workflowName: string } | null = null;
+	let pendingWorkflowLaunch: { owner: string; workflowName: string; armedAt: number } | null = null;
+
+	// Expire unclaimed attribution state. Runs on every event that could
+	// otherwise consume it, plus the inbox safety tick.
+	const sweepPendingState = () => {
+		const now = Date.now();
+		// Both expiries are deliberately NOT error records: a queued follow_up can
+		// legitimately outlive the binding TTL (input timing at delivery is
+		// undocumented), and a cold-start workflow admission can outlive the
+		// launch TTL. An error record would fail a possibly-live --wait with a
+		// spurious exit 5; a typed note prevents future capture without killing it.
+		for (const [key, binding] of pendingBindings) {
+			if (now - binding.at > BINDING_TTL_MS) {
+				pendingBindings.delete(key);
+				emit({ type: "binding_expired", id: binding.id, reason: "ttl" });
+			}
+		}
+		if (pendingWorkflowLaunch !== null && now - pendingWorkflowLaunch.armedAt > LAUNCH_TTL_MS) {
+			emit({
+				type: "workflow_launch_expired",
+				id: pendingWorkflowLaunch.owner,
+				workflowName: pendingWorkflowLaunch.workflowName,
+			});
+			pendingWorkflowLaunch = null;
+		}
+	};
 
 	// Serial command queue (roadmap #4).
 	let chain: Promise<void> = Promise.resolve();
@@ -296,11 +382,14 @@ export default function (pi: ExtensionAPI) {
 			if (outboxApproxBytes > OUTBOX_MAX_BYTES) {
 				// Readers drain the renamed file from their last offset before switching
 				// to the fresh one (same inode), so rotation loses nothing.
-				fs.appendFileSync(outboxPath, `${JSON.stringify({ type: "outbox_rotated", ts: new Date().toISOString() })}\n`);
+				fs.appendFileSync(
+					outboxPath,
+					`${JSON.stringify({ type: "outbox_rotated", seq: seqCounter++, ts: new Date().toISOString() })}\n`,
+				);
 				fs.renameSync(outboxPath, `${outboxPath.replace(/\.jsonl$/, "")}.1.jsonl`);
 				outboxApproxBytes = 0;
 			}
-			const line = `${JSON.stringify({ ...record, ts: new Date().toISOString() })}\n`;
+			const line = `${JSON.stringify({ ...record, seq: seqCounter++, ts: new Date().toISOString() })}\n`;
 			fs.appendFileSync(outboxPath, line, { mode: 0o600 });
 			outboxApproxBytes += Buffer.byteLength(line);
 			outboxModeApplied = true;
@@ -373,6 +462,17 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return;
 		}
+		if (entryCursor === 0 && lastEntryId !== null) {
+			// Fresh extension instance on an existing session: resume after the
+			// last entry the previous instance scanned. Not found (new session,
+			// different tree) means scan from the top.
+			for (let i = entries.length - 1; i >= 0; i--) {
+				if ((entries[i] as { id?: unknown } | null)?.id === lastEntryId) {
+					entryCursor = i + 1;
+					break;
+				}
+			}
+		}
 		for (; entryCursor < entries.length; entryCursor++) {
 			const entry = entries[entryCursor] as {
 				type?: string;
@@ -380,7 +480,21 @@ export default function (pi: ExtensionAPI) {
 				details?: WorkflowLifecycleDetails;
 				content?: unknown;
 			} | null;
-			if (entry?.type !== "custom_message" || entry.customType !== WORKFLOW_LIFECYCLE_CUSTOM_TYPE) continue;
+			if (entry?.type !== "custom_message") continue;
+			if (entry.customType === WORKFLOW_HEARTBEAT_CUSTOM_TYPE) {
+				const heartbeat = entry.details as { runId?: unknown; workflowName?: unknown } | undefined;
+				if (typeof heartbeat?.runId !== "string") continue;
+				const hbRunId = heartbeat.runId.toLowerCase();
+				emit({
+					type: "workflow_heartbeat",
+					runId: hbRunId,
+					owner: knownRuns.get(hbRunId)?.owner ?? null,
+					workflowName: typeof heartbeat.workflowName === "string" ? heartbeat.workflowName : null,
+					text: typeof entry.content === "string" ? entry.content.slice(0, 500) : null,
+				});
+				continue;
+			}
+			if (entry.customType !== WORKFLOW_LIFECYCLE_CUSTOM_TYPE) continue;
 			const details = entry.details;
 			if (!details || typeof details.runId !== "string" || typeof details.kind !== "string") continue;
 			const runId = details.runId.toLowerCase();
@@ -420,6 +534,22 @@ export default function (pi: ExtensionAPI) {
 				text: typeof entry.content === "string" ? entry.content.slice(0, 2000) : null,
 			});
 		}
+		if (entries.length > 0) {
+			const tailId = (entries[entries.length - 1] as { id?: unknown } | null)?.id;
+			if (typeof tailId === "string" && tailId !== lastEntryId) {
+				lastEntryId = tailId;
+				// In-flight runs must survive alongside the cursor: a fresh instance
+				// that resumes after lastEntryId never re-reads their notices, so
+				// without this it would report no pendingWorkflows after a /reload
+				// and settle non-provisionally while a run is still alive.
+				writeMeta({
+					lastEntryId,
+					pendingRuns: [...knownRuns.entries()]
+						.filter(([, run]) => !run.terminal)
+						.map(([runId, run]) => ({ runId, owner: run.owner })),
+				});
+			}
+		}
 	};
 
 	const ensureWorkflowTimer = (ctx: { sessionManager?: { getEntries?: () => unknown[] } }) => {
@@ -450,7 +580,14 @@ export default function (pi: ExtensionAPI) {
 		let bindingKey: string | null = null;
 		const bind = (text: string) => {
 			bindingKey = normalizeForBinding(text);
-			pendingBindings.set(bindingKey, cmd.id);
+			if (pendingBindings.size >= BINDING_CAP) {
+				const oldest = pendingBindings.entries().next().value;
+				if (oldest) {
+					pendingBindings.delete(oldest[0]);
+					emit({ type: "binding_expired", id: oldest[1].id, reason: "evicted" });
+				}
+			}
+			pendingBindings.set(bindingKey, { id: cmd.id, at: Date.now() });
 		};
 		// A plan travels the channel as structure and lands twice: as a durable
 		// artifact under plans/ and inline in the injected message, so the agent
@@ -490,6 +627,7 @@ export default function (pi: ExtensionAPI) {
 							.map(([runId]) => runId),
 						protocol: PROTOCOL,
 						bridgeVersion: BRIDGE_VERSION,
+						...(cmd.include?.includes("commands") ? { commands: knownCommandNames(pi) ?? [] } : {}),
 					});
 					return;
 				}
@@ -529,13 +667,28 @@ export default function (pi: ExtensionAPI) {
 					});
 					return;
 				}
-				case "command":
+				case "command": {
+					// Validate the slash name against the session's advertised surface:
+					// an unknown command would degrade to chat text the model may or
+					// may not obey — the silent failure this action exists to avoid.
+					const slashName = cmd.message.trim().slice(1).split(/\s+/)[0] ?? "";
+					const known = knownCommandNames(pi);
+					if (known && !known.includes(slashName)) {
+						emit({
+							type: "error",
+							id: cmd.id,
+							error: `unknown slash command: /${slashName}`,
+							available: known.slice(0, 20),
+						});
+						return;
+					}
 					// expandPromptTemplates is load-bearing: without it the injected
 					// slash command is plain chat text for the model, not a dispatch.
 					bind(cmd.message);
 					await Promise.resolve(pi.sendUserMessage(cmd.message, { expandPromptTemplates: true }));
 					emit({ type: "accepted", id: cmd.id, action: "command", delivered: "command", contended });
 					return;
+				}
 				case "run_workflow": {
 					const cwd = String(readMeta()?.cwd ?? process.cwd());
 					const workflowDir = path.join(cwd, ".atomic", "workflows");
@@ -554,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 					const runText = `/workflow ${cmd.workflowName}${cmd.args ? ` ${cmd.args}` : ""}`;
 					// A handled slash command emits no input event: attribution comes
 					// from the "started" lifecycle notice, not from a text binding.
-					pendingWorkflowLaunch = { owner: cmd.id, workflowName: cmd.workflowName };
+					pendingWorkflowLaunch = { owner: cmd.id, workflowName: cmd.workflowName, armedAt: Date.now() };
 					await Promise.resolve(pi.sendUserMessage(runText, { expandPromptTemplates: true }));
 					emit({ type: "accepted", id: cmd.id, action: "run_workflow", workflowName: cmd.workflowName, contended });
 					return;
@@ -564,7 +717,13 @@ export default function (pi: ExtensionAPI) {
 					await Promise.resolve(
 						pi.sendMessage(
 							{ customType: "atomic-remote", content: cmd.message, display: true },
-							{ triggerTurn: true, deliverAs: "interrupt" },
+							{
+								triggerTurn: true,
+								deliverAs: "interrupt",
+								// Replaces the generic abort result in the model's context, so
+								// the transcript says why the previous turn died.
+								interruptAbortMessage: `interrupted by atomic-remote command ${cmd.id}`,
+							},
 						),
 					);
 					emit({ type: "accepted", id: cmd.id, action: "interrupt", contended });
@@ -572,6 +731,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} catch (error) {
 			if (cmd.action === "interrupt" && interruptPending === cmd.id) interruptPending = null;
+			if (cmd.action === "run_workflow" && pendingWorkflowLaunch?.owner === cmd.id) pendingWorkflowLaunch = null;
 			if (bindingKey !== null) pendingBindings.delete(bindingKey);
 			emit({ type: "error", id: cmd.id, error: error instanceof Error ? error.message : String(error) });
 		}
@@ -643,19 +803,24 @@ export default function (pi: ExtensionAPI) {
 			} catch {}
 			return;
 		}
-		chain = chain
-			.then(() => handleCommand(parsed, ctx))
-			.catch((error) => {
-				emit({ type: "error", id: parsed.id, error: error instanceof Error ? error.message : String(error) });
-			})
-			.then(() => {
-				try {
-					fs.rmSync(processing, { force: true });
-				} catch {}
-			});
+		const cleanup = () => {
+			try {
+				fs.rmSync(processing, { force: true });
+			} catch {}
+		};
+		const report = (error: unknown) => {
+			emit({ type: "error", id: parsed.id, error: error instanceof Error ? error.message : String(error) });
+		};
+		if (CONTROL_ACTIONS.includes(parsed.action)) {
+			// No shared write target with the injection lane: safe to run now.
+			void handleCommand(parsed, ctx).catch(report).then(cleanup);
+			return;
+		}
+		chain = chain.then(() => handleCommand(parsed, ctx)).catch(report).then(cleanup);
 	};
 
 	const consumeInbox = (ctx: Parameters<typeof handleCommand>[1]) => {
+		sweepPendingState();
 		if (!inboxDir) return;
 		let names: string[];
 		try {
@@ -718,6 +883,7 @@ export default function (pi: ExtensionAPI) {
 		// A session switch (/new, /resume, /fork) reuses this engine process:
 		// everything scoped to the previous session must not leak into this one.
 		pendingBindings.clear();
+		pendingWorkflowLaunch = null;
 		interruptPending = null;
 		activeOwner = null;
 		preemptedOwner = null;
@@ -742,6 +908,25 @@ export default function (pi: ExtensionAPI) {
 		outboxPath = path.join(sessionDir, "outbox.jsonl");
 		outboxModeApplied = false;
 		fs.mkdirSync(path.join(inboxDir, ".tmp"), { recursive: true, mode: 0o700 });
+		// Resume the durable entry cursor left by a previous instance of this
+		// same session (reload / engine replacement); a new session dir has none.
+		lastEntryId = ((): string | null => {
+			const previous = readMeta()?.lastEntryId;
+			return typeof previous === "string" ? previous : null;
+		})();
+		// Rebuild the in-flight runs the previous instance was tracking: the
+		// resumed cursor deliberately skips their already-mirrored notices.
+		if (lastEntryId !== null) {
+			const persisted = readMeta()?.pendingRuns;
+			if (Array.isArray(persisted)) {
+				for (const item of persisted) {
+					const runId = (item as { runId?: unknown } | null)?.runId;
+					if (typeof runId !== "string") continue;
+					const owner = (item as { owner?: unknown }).owner;
+					knownRuns.set(runId, { owner: typeof owner === "string" ? owner : null, terminal: false });
+				}
+			}
+		}
 		try {
 			fs.chmodSync(bridgeRoot, 0o700);
 			fs.chmodSync(sessionDir, 0o700);
@@ -810,15 +995,16 @@ export default function (pi: ExtensionAPI) {
 	// --- Attribution (roadmap #2) ------------------------------------------
 
 	pi.on("input", async (event) => {
+		sweepPendingState();
 		const source = (event as { source?: string }).source;
 		const text = (event as { text?: string }).text ?? "";
 		if (source === "extension") {
 			const key = normalizeForBinding(text);
-			const owner = pendingBindings.get(key);
-			if (owner) {
+			const binding = pendingBindings.get(key);
+			if (binding) {
 				pendingBindings.delete(key);
-				activeOwner = owner;
-				emit({ type: "turn_bound", id: owner });
+				activeOwner = binding.id;
+				emit({ type: "turn_bound", id: binding.id });
 			}
 			return;
 		}
@@ -832,6 +1018,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
+		sweepPendingState();
 		agentRunning = true;
 		endSeenSinceStart = false;
 		if (interruptPending !== null) {
@@ -857,7 +1044,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (!endSeenSinceStart && preemptedOwner !== null) {
+		sweepPendingState();
+		// A settle can only be the interrupt's own once the engine has nothing
+		// left to run: agent_settled means "no automatic continuation left"
+		// (extensions.md), so a settle arriving while the engine is still busy
+		// belongs to the preempted run, whatever agent_end ordering said.
+		// Accepted residual risk: if the engine ever reported busy at the
+		// interrupt's OWN settle (contradicting the documented settle semantics)
+		// AND the aborted run never settled first, this branch would steal it and
+		// the interrupt --wait would end at its idle timeout (bounded exit 2, not
+		// a hang). The two observable signals are otherwise symmetric; no
+		// discriminator on these events can separate that case.
+		const engineStillBusy = (() => {
+			const engine = ctx as { isIdle?: () => boolean };
+			try {
+				return engine?.isIdle ? !engine.isIdle() : false;
+			} catch {
+				return false;
+			}
+		})();
+		if (preemptedOwner !== null && (!endSeenSinceStart || engineStillBusy)) {
 			// The preempted run settling late, after the interrupt's turn already
 			// started (live-observed ordering). Attribute it to the old owner as
 			// aborted and leave the running interrupt turn's state untouched.

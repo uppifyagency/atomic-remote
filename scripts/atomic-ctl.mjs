@@ -1,18 +1,9 @@
 #!/usr/bin/env node
 /**
- * atomic-ctl v2 — Claude Code-side controller for the atomic-remote bridge.
+ * atomic-ctl v0.3.1 — Claude Code-side controller for the atomic-remote bridge.
  *
- * Usage:
- *   atomic-ctl.mjs list [--json] [--all]
- *   atomic-ctl.mjs ping <target>
- *   atomic-ctl.mjs status <target>
- *   atomic-ctl.mjs send <target> <message...> [--mode prompt|steer|follow_up|interrupt]
- *                  [--wait] [--idle-timeout <s>] [--timeout <s>] [--accept-partial]
- *                  [--message-file <path>]
- *   atomic-ctl.mjs tail <target> [--lines <n>]
- *   atomic-ctl.mjs follow <target> [--for <s>]
- *   atomic-ctl.mjs abort <target>
- *   atomic-ctl.mjs prune [--older-than <days>]
+ * Usage: run with --help. The USAGE constant below is the single authoritative
+ * command reference; this header deliberately does not duplicate it.
  *
  * <target>: bridge name, session-id prefix, cwd (exact path or basename), or
  * "auto" (allowed only when exactly one live session exists).
@@ -133,6 +124,14 @@ function resolveTarget(token, { anyState = false } = {}) {
 
 // --- outbox reader: stateful, rewind-safe (roadmap #5) ----------------------
 
+// One dedupe identity for every reader (live wait, follow, outcome replay).
+// seq is a strict total order written by bridges ≥ 0.3.1; the composite
+// key stays as the fallback for records older bridges wrote without one.
+function recordKey(record) {
+	if (typeof record.seq === "number") return `s|${record.seq}`;
+	return `${record.type}|${record.id ?? ""}|${record.runId ?? ""}|${record.kind ?? ""}|${record.ts ?? ""}`;
+}
+
 function makeOutboxReader(outbox) {
 	const state = { ino: null, offset: 0, seen: new Set() };
 
@@ -201,13 +200,69 @@ function makeOutboxReader(outbox) {
 			} catch {
 				continue;
 			}
-			const key = `${record.type}|${record.id ?? ""}|${record.runId ?? ""}|${record.kind ?? ""}|${record.ts ?? ""}`;
+			const key = recordKey(record);
 			if (state.seen.has(key)) continue;
 			state.seen.add(key);
 			items.push(record);
 		}
 		return items;
 	};
+}
+
+// --- workflow statusFile (ROADMAP 0.3.1 item 2) -------------------------------
+// When the target project enables `statusFile: true` in its workflow config,
+// the workflow runtime writes a derived snapshot to .atomic/workflows/status.json.
+// Reading it costs zero tokens and is the only way to see awaiting_input runs,
+// which by design never produce a main-chat notice the bridge could mirror.
+
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readWorkflowStatus(target) {
+	if (!target.cwd) return null;
+	const file = path.join(String(target.cwd), ".atomic", "workflows", "status.json");
+	let snapshot;
+	try {
+		snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return null;
+	}
+	const runs = Array.isArray(snapshot?.runs)
+		? snapshot.runs.map((run) => ({
+				runId: String(run?.id ?? "").toLowerCase(),
+				name: typeof run?.name === "string" ? run.name : null,
+				status: typeof run?.status === "string" ? run.status : null,
+			}))
+		: [];
+	return { path: file, runs };
+}
+
+function awaitingInputRuns(target, runIds) {
+	const status = readWorkflowStatus(target);
+	if (!status) return [];
+	const wanted = new Set([...runIds].map((id) => String(id).toLowerCase()));
+	return status.runs.filter((run) => wanted.has(run.runId) && run.status === "awaiting_input");
+}
+
+function annotateAwaiting(target, snapshot) {
+	if (!Array.isArray(snapshot.runs) || snapshot.runs.length === 0) return snapshot;
+	const awaiting = new Set(
+		awaitingInputRuns(
+			target,
+			snapshot.runs.map((run) => run.runId),
+		).map((run) => run.runId),
+	);
+	if (awaiting.size === 0) return snapshot;
+	return {
+		...snapshot,
+		runs: snapshot.runs.map((run) => (awaiting.has(String(run.runId).toLowerCase()) ? { ...run, awaitingInput: true } : run)),
+	};
+}
+
+function awaitingHint(target, runIds) {
+	const awaiting = awaitingInputRuns(target, runIds);
+	if (awaiting.length === 0) return "";
+	const ids = awaiting.map((run) => run.runId).join(", ");
+	return `\nRun(s) awaiting human input: ${ids}\nUnblock with: answer ${String(target.id).slice(0, 8)} <runId> "<answer>"`;
 }
 
 // --- command transport (roadmap #1: refuse delivery to the dead) ------------
@@ -224,6 +279,17 @@ function writeCommand(target, payload) {
 	if (readHeartbeat(target.dir).state !== "live") {
 		fail(`Session ${target.id} stopped responding (stale heartbeat) — command not delivered.`, 3);
 	}
+	// Re-read meta at delivery time: a session can shut down between target
+	// resolution and this write, and its heartbeat stays fresh-looking for up
+	// to HEARTBEAT_STALE_MS. Writing would recreate an inbox nobody reads.
+	try {
+		const meta = JSON.parse(fs.readFileSync(path.join(target.dir, "meta.json"), "utf8"));
+		if (meta.status === "closed") {
+			fail(`Session ${target.id} closed (${meta.closeReason ?? "quit"}) — command not delivered.`, 3);
+		}
+	} catch {
+		// Unreadable meta: the heartbeat check above stays the authority.
+	}
 	const inbox = path.join(target.dir, "inbox");
 	const tmpDir = path.join(inbox, ".tmp");
 	fs.mkdirSync(tmpDir, { recursive: true });
@@ -238,7 +304,12 @@ function writeCommand(target, payload) {
 // machine, so a --wait that exited 2 and a later `outcome` cannot disagree.
 
 function createOutcomeTracker(payload, flags) {
-	const isPrompt = ["prompt", "interrupt", "command", "run_workflow"].includes(payload.action);
+	// Derived from the CURRENT action, not captured at construction: a post-hoc
+	// replay starts as "unknown" and adopts the action the accepted record
+	// carries, so a replayed steer classifies like the live wait did.
+	// "unknown" counts as prompt-like (conservative: no weak attribution).
+	const PROMPT_LIKE = ["prompt", "interrupt", "command", "run_workflow", "unknown"];
+	const isPrompt = () => PROMPT_LIKE.includes(st.action);
 	const st = {
 		accepted: false,
 		action: payload.action,
@@ -281,10 +352,24 @@ function createOutcomeTracker(payload, flags) {
 			case "turn_bound":
 				if (record.id === payload.id) st.bound = true;
 				break;
+			case "binding_expired":
+				if (record.id === payload.id)
+					out.push({
+						op: "note",
+						message: "note: turn binding expired unclaimed — attribution downgraded; delivery may still happen",
+					});
+				break;
+			case "workflow_launch_expired":
+				if (record.id === payload.id)
+					out.push({
+						op: "note",
+						message: `note: no "started" notice observed for the launched workflow — slow admission or failed launch; check later with outcome`,
+					});
+				break;
 			case "foreign_input":
 				if (st.accepted && !st.bound) {
 					st.foreignSeen = true;
-					if (isPrompt && !flags.acceptPartial) {
+					if (isPrompt() && !flags.acceptPartial) {
 						st.failure = {
 							state: "uncertain",
 							code: 6,
@@ -324,7 +409,7 @@ function createOutcomeTracker(payload, flags) {
 				if (!st.accepted) break;
 				const owned = record.owner === payload.id;
 				const weaklyOwned =
-					record.owner === null && !st.bound && !isPrompt && !st.foreignSeen && !record.foreignInputSeen;
+					record.owner === null && !st.bound && !isPrompt() && !st.foreignSeen && !record.foreignInputSeen;
 				if (!owned && !weaklyOwned) break;
 				if (owned && record.aborted) {
 					st.failure = {
@@ -335,7 +420,7 @@ function createOutcomeTracker(payload, flags) {
 					out.push({ op: "fail", code: 5, message: st.failure.message });
 					break;
 				}
-				if (owned && record.foreignInputSeen && isPrompt && !flags.acceptPartial) {
+				if (owned && record.foreignInputSeen && isPrompt() && !flags.acceptPartial) {
 					st.failure = {
 						state: "uncertain",
 						code: 6,
@@ -415,7 +500,7 @@ async function waitForOutcome(target, payload, flags) {
 	let closeReason = null;
 	const tracker = createOutcomeTracker(payload, flags);
 	const finish = (code) => {
-		if (flags.json) console.log(JSON.stringify(tracker.snapshot(), null, 2));
+		if (flags.json) console.log(JSON.stringify(annotateAwaiting(target, tracker.snapshot()), null, 2));
 		return code;
 	};
 
@@ -433,7 +518,16 @@ async function waitForOutcome(target, payload, flags) {
 				return 0;
 			}
 			if (record.type === "status_report" && record.id === payload.id) {
-				console.log(JSON.stringify(record, null, 2));
+				if (Array.isArray(payload.include) && payload.include.includes("commands") && !("commands" in record))
+					console.error("note: this bridge does not support --commands (pre-0.3.1) — rerun setup + /reload");
+				const workflowStatus = readWorkflowStatus(target);
+				const pending = Array.isArray(record.pendingWorkflows) ? record.pendingWorkflows : [];
+				if (!workflowStatus && pending.length > 0) {
+					console.error(
+						"note: pending workflow runs but no statusFile — enable `statusFile: true` in the project's workflow config to see awaiting-input runs from here",
+					);
+				}
+				console.log(JSON.stringify(workflowStatus ? { ...record, workflowStatus } : record, null, 2));
 				return 0;
 			}
 			if (record.type === "accepted" && record.id === payload.id && payload.action === "abort") {
@@ -485,14 +579,15 @@ async function waitForOutcome(target, payload, flags) {
 		const myRuns = tracker.state.myRuns;
 		if (flags.timeoutS > 0 && totalMs > flags.timeoutS * 1000) {
 			if (flags.json) process.exit(finish(myRuns.size > 0 ? 7 : 2));
-			if (myRuns.size > 0) fail(`Absolute timeout; workflow still running: ${[...myRuns].join(", ")}`, 7);
+			if (myRuns.size > 0)
+				fail(`Absolute timeout; workflow still running: ${[...myRuns].join(", ")}${awaitingHint(target, myRuns)}`, 7);
 			fail(`Absolute timeout after ${flags.timeoutS}s — check later: tail ${target.id.slice(0, 8)}`, 2);
 		}
 		if (idleMs > flags.idleTimeoutS * 1000) {
 			if (flags.json) process.exit(finish(myRuns.size > 0 ? 7 : 2));
 			if (myRuns.size > 0)
 				fail(
-					`No bridge activity for ${flags.idleTimeoutS}s; detached workflow still running: ${[...myRuns].join(", ")}`,
+					`No bridge activity for ${flags.idleTimeoutS}s; detached workflow still running: ${[...myRuns].join(", ")}${awaitingHint(target, myRuns)}`,
 					7,
 				);
 			fail(
@@ -518,6 +613,7 @@ const FLAG_SPECS = {
 	"--lines": { key: "lines", takesValue: true, numeric: true },
 	"--for": { key: "forS", takesValue: true, numeric: true },
 	"--older-than": { key: "olderThanDays", takesValue: true, numeric: true },
+	"--commands": { key: "commands", takesValue: false },
 	"--json": { key: "json", takesValue: false },
 	"--all": { key: "all", takesValue: false },
 	"--verbose": { key: "verbose", takesValue: false },
@@ -539,6 +635,7 @@ function parseArgs(args) {
 		lines: 20,
 		forS: null, // null = command default (DEFAULT_FOLLOW_S); 0 = unbounded
 		olderThanDays: PRUNE_DEFAULT_DAYS,
+		commands: false,
 		json: false,
 		all: false,
 		verbose: false,
@@ -572,12 +669,13 @@ function newCommandId() {
 
 // --- main ---------------------------------------------------------------------
 
-const USAGE = `atomic-ctl v2 — command running Atomic sessions via the atomic-remote bridge
+const USAGE = `atomic-ctl v0.3.1 — command running Atomic sessions via the atomic-remote bridge
 
 Commands:
   list [--json] [--all]        Show sessions (live/stale; --all includes closed)
   ping <target>                Round-trip liveness + protocol check
-  status <target>              Ask the bridge for idle/busy, pending workflows
+  status <target> [--commands] Ask the bridge for idle/busy, pending workflows;
+       --commands also lists the session's slash-command surface
   send <target> <message...>   Inject a command; message "-" reads stdin
        [--mode prompt|steer|follow_up|interrupt|command] [--wait] [--json]
        [--plan <plan.json>] [--idle-timeout <s>=120] [--timeout <s>]
@@ -587,6 +685,9 @@ Commands:
   run-workflow <target> <file.ts> [--name <n>] [--args "<a>"] [--wait] [--json]
        Install the workflow into the session's .atomic/workflows/, reload,
        and run it deterministically (proto 3)
+  answer <target> <run-id> <answer...> [--wait]
+       Unblock a workflow run awaiting human input: instructs the agent to
+       deliver the answer via the workflow tool (send/delivery:"answer")
   outcome <target> <command-id> [--json]
        Query a past command's result from outbox history (safe to poll;
        works on closed sessions): state pending|working|completed|failed|
@@ -628,7 +729,11 @@ async function main() {
 			process.exit(
 				await waitForOutcome(
 					target,
-					{ id: newCommandId(), action: command },
+					{
+						id: newCommandId(),
+						action: command,
+						...(command === "status" && flags.commands ? { include: ["commands"] } : {}),
+					},
 					{
 						...flags,
 						idleTimeoutS: flags.idleTimeoutS !== DEFAULT_IDLE_TIMEOUT_S ? flags.idleTimeoutS : quickS,
@@ -728,13 +833,41 @@ async function main() {
 			process.exit(await waitForOutcome(target, payload, flags));
 			break;
 		}
+		case "answer": {
+			// Unblocks a workflow run waiting on a human: injects a follow_up that
+			// instructs the agent to deliver the answer through the workflow tool
+			// (the bridge cannot invoke another extension's tool directly).
+			const [token, runId, ...answerParts] = rest;
+			const answerText = answerParts.join(" ").trim();
+			if (!runId || !answerText) fail('Usage: answer <target|auto> <run-id> <answer...> [--wait]');
+			if (!RUN_ID_PATTERN.test(runId)) {
+				fail(`answer: run id must be a full 36-character UUID, got "${runId}" (${runId.length} chars)`);
+			}
+			const target = resolveTarget(token);
+			const message =
+				`A workflow run is waiting for human input: ${runId}.\n` +
+				`Deliver this answer now by calling the workflow tool with ` +
+				`{"action": "send", "runId": "${runId}", "response": <the answer below>, "delivery": "answer"}. ` +
+				`If the prompt needs promptId/stageId, look them up first with {"action": "status", "runId": "${runId}"}. ` +
+				`Then report the tool result.\n\nAnswer to deliver:\n${answerText}`;
+			const payload = { id: newCommandId(), action: "follow_up", message };
+			if (!flags.wait) {
+				writeCommand(target, payload);
+				console.log(`Sent answer for run ${runId} to ${target.name ?? target.id} (command id ${payload.id}).`);
+				return;
+			}
+			process.exit(await waitForOutcome(target, payload, flags));
+			break;
+		}
 		case "outcome": {
 			const [token, commandId] = rest;
 			if (!commandId) fail("Usage: outcome <target> <command-id> [--json]");
 			const target = resolveTarget(token, { anyState: true });
 			// Post-hoc: replay the full history (rotated file first) through the
-			// same reducer the wait loop uses, then read its verdict.
-			const tracker = createOutcomeTracker({ id: commandId, action: "prompt" }, flags);
+			// same reducer the wait loop uses, then read its verdict. The action
+			// starts unknown and is adopted from the accepted record.
+			const tracker = createOutcomeTracker({ id: commandId, action: "unknown" }, flags);
+			const replayed = new Set();
 			let seen = false;
 			for (const file of [path.join(target.dir, "outbox.1.jsonl"), path.join(target.dir, "outbox.jsonl")]) {
 				let content;
@@ -752,23 +885,32 @@ async function main() {
 					} catch {
 						continue;
 					}
+					const key = recordKey(record);
+					if (replayed.has(key)) continue;
+					replayed.add(key);
 					if (record.id === commandId || record.owner === commandId) seen = true;
 					tracker.apply(record);
 				}
 			}
 			if (!seen) fail(`No outbox record mentions command ${commandId} in session ${target.id}.`, 4);
-			const outcome = tracker.snapshot();
+			const outcome = annotateAwaiting(target, tracker.snapshot());
 			console.log(JSON.stringify(outcome, null, 2));
 			return;
 		}
 		case "tail": {
 			const target = resolveTarget(rest[0], { anyState: true });
-			const outbox = path.join(target.dir, "outbox.jsonl");
-			if (!fs.existsSync(outbox)) {
+			// Rotated generation first, like outcome: history must not vanish from
+			// tail the moment the bridge rotates.
+			const lines = [];
+			for (const file of [path.join(target.dir, "outbox.1.jsonl"), path.join(target.dir, "outbox.jsonl")]) {
+				try {
+					lines.push(...fs.readFileSync(file, "utf8").trimEnd().split("\n"));
+				} catch {}
+			}
+			if (lines.length === 0) {
 				console.log("(outbox empty)");
 				return;
 			}
-			const lines = fs.readFileSync(outbox, "utf8").trimEnd().split("\n");
 			console.log(lines.slice(-flags.lines).join("\n"));
 			return;
 		}

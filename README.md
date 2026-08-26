@@ -5,7 +5,7 @@
 <br><br>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-38bdf8?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.1-38bdf8?style=flat-square)](CHANGELOG.md)
 [![Protocol](https://img.shields.io/badge/protocol-v3-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v3-guarantees)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-4ade80?style=flat-square)](#)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
@@ -37,7 +37,7 @@ Zero dependencies. Local-only. Built exclusively on Atomic's documented extensio
                                              ┌───────────┴──────────────────┐
                                              │  Atomic TUI session          │
                                              │  + atomic-remote-bridge.ts   │
-                                             │    (extension, protocol v2)  │
+                                             │    (extension, protocol v3)  │
                                              └──────────────────────────────┘
 ```
 
@@ -58,7 +58,7 @@ claude plugin install atomic-remote@atomic-remote
 
 **2. Atomic side** — from any Claude Code session run `/atomic-remote:setup`
 (or manually: `node scripts/install-bridge.mjs`). Then, **inside the running Atomic
-session**, run `/reload`. You'll see: `atomic-remote bridge v0.2.1 active (…)`.
+session**, run `/reload`. You'll see: `atomic-remote bridge v0.3.1 active (…)`.
 
 Sessions are named automatically after their working directory; override with
 `/remote-name <name>` inside Atomic or `/name` (tracked automatically).
@@ -80,13 +80,14 @@ Direct CLI:
 ```bash
 node scripts/atomic-ctl.mjs list [--json] [--all]
 node scripts/atomic-ctl.mjs ping <target>
-node scripts/atomic-ctl.mjs status <target>
+node scripts/atomic-ctl.mjs status <target> [--commands]
 node scripts/atomic-ctl.mjs send <target|auto> "message" \
     [--mode prompt|steer|follow_up|interrupt|command] [--wait] [--json] \
     [--plan <plan.json>] [--idle-timeout <s>] [--timeout <s>] \
     [--message-file <path>] [--accept-partial] [-v|--verbose]
 node scripts/atomic-ctl.mjs run-workflow <target|auto> <file.ts> \
     [--name <name>] [--args "<args>"] [--wait] [--json]
+node scripts/atomic-ctl.mjs answer <target> <run-id> "the answer" [--wait]
 node scripts/atomic-ctl.mjs outcome <target> <command-id> [--json]
 node scripts/atomic-ctl.mjs follow <target> [--for <s>]   # default 30s; --for 0 = forever
 node scripts/atomic-ctl.mjs tail <target> [--lines <n>]
@@ -136,6 +137,16 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 - **Workflow-aware waits.** If your command launches an Atomic workflow, `--wait`
   follows the run to its terminal lifecycle notice instead of printing
   "Workflow started" as if it were the result.
+- **Human-in-the-loop visibility.** When the project enables `statusFile: true`
+  in its workflow config, `status` merges a `workflowStatus` section from
+  `.atomic/workflows/status.json`, waits and `outcome` flag runs with
+  `awaitingInput: true`, and `answer <target> <run-id> "..."` unblocks a run
+  paused on a human question — the one state that is invisible on the main chat.
+- **Long runs stay observable.** The workflow engine's periodic heartbeat cards
+  are mirrored as `workflow_heartbeat` records (one per run, ~15 min), which
+  also reset `--wait`'s idle timeout; unclaimed attribution state expires as
+  typed `binding_expired` / `workflow_launch_expired` notes instead of
+  lingering forever or killing a live wait.
 - **Liveness by heartbeat.** Sessions are `live` / `stale` / `closed` based on a 5 s
   heartbeat — not on a transient engine pid that Atomic legitimately replaces.
   Delivery to a dead bridge is refused up front, not discovered by timeout.
@@ -154,7 +165,7 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 | 0 | Completed; stdout is the attributed reply |
 | 1 | Usage error (unknown flag or malformed arguments) |
 | 2 | Idle/absolute timeout (session may still be working — check `tail`) |
-| 3 | No session recorded / delivery refused (stale heartbeat) |
+| 3 | No session recorded / delivery refused (stale heartbeat or closed session) |
 | 4 | Target not found or ambiguous |
 | 5 | Bridge or run error (including failed workflows) |
 | 6 | Attribution uncertain — concurrent user input; inspect with `tail` |
