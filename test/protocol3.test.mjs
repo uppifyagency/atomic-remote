@@ -3,7 +3,7 @@ import { test } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { makeAgentDir, makeSession, runCtl, makeFakePi, makeBridgeCtx, readOutbox, untilOutbox } from "./helpers.mjs";
+import { makeAgentDir, makeSession, runCtl, makeFakePi, makeBridgeCtx, makeWorkflowEvents, readOutbox, untilOutbox } from "./helpers.mjs";
 
 // Protocol v3 contracts: structured plan handoff, queryable outcomes, and a
 // single source of truth for busy/idle. Written red against the v2 baseline.
@@ -28,6 +28,8 @@ async function boot(t, { piOptions = {}, ctxOptions = {} } = {}) {
 		world,
 		ctx,
 		dir,
+		ev: makeWorkflowEvents(sessionId),
+		hook: (event) => world.fire(event.type, event, ctx),
 		drop(payload) {
 			const file = `${String(Date.now()).padStart(14, "0")}-${String(dropSeq++).padStart(3, "0")}-drop.json`;
 			fs.writeFileSync(path.join(inboxDir, ".tmp", file), JSON.stringify(payload));
@@ -108,15 +110,10 @@ test("run_workflow: installs the TS, reloads, runs, and binds to the run injecti
 		],
 	);
 	// A handled slash command emits no input event; attribution binds via the
-	// run's own "started" notice, matched on workflow name.
+	// run's typed first sight, checked against its workflow.run.start name.
 	const runId = "12121212-abcd-4ef0-9876-343434345656";
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		content: "Workflow demo-flow started",
-		details: { kind: "started", scope: "run", runId, workflowName: "demo-flow", status: "running" },
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-p3", data: { runId, name: "demo-flow" } });
+	await b.hook(b.ev.run(runId, "running"));
 	const started = await b.until((r) => r.type === "workflow_started" && r.runId === runId);
 	assert.equal(started.owner, "wf-run-1", "the slash-launched run must be attributed to the command");
 });
@@ -133,43 +130,12 @@ test("run_workflow: overwriting an existing workflow file is reported", async (t
 	assert.equal(installed.overwrote, true, "clobbering a hand-written workflow must be visible");
 });
 
-test("lifecycle: structural notice detected; assistant text quoting a runId is ignored", async (t) => {
-	const b = await boot(t);
-	const runId = "99998888-abcd-4ef0-9876-aaaabbbbcccc";
-	// The v2 regex false positive: assistant text mentioning runId + "workflow completed".
-	b.ctx.entries.push({
-		type: "message",
-		message: { role: "assistant", content: [{ type: "text", text: `the workflow ${runId} completed earlier, I think` }] },
-	});
-	// The v2 regex false negative: a real notice whose text has no terminal keyword.
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		content: "Run ended without incident",
-		details: { kind: "failed", scope: "run", runId, workflowName: "deploy", status: "failed", failedStageId: "build", error: "tsc exit 2" },
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
-	const lifecycles = b.records().filter((r) => r.type === "workflow_lifecycle");
-	assert.equal(lifecycles.length, 1, "exactly the structured notice, nothing from assistant prose");
-	const record = lifecycles[0];
-	assert.equal(record.kind, "failed");
-	assert.equal(record.terminal, true);
-	assert.equal(record.workflowName, "deploy");
-	assert.equal(record.failedStageId, "build");
-	assert.equal(record.error, "tsc exit 2");
-});
-
 test("lifecycle: stage-scope events are mirrored but never terminal", async (t) => {
 	const b = await boot(t);
 	const runId = "77776666-abcd-4ef0-9876-ddddeeeeffff";
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		content: "Stage build completed",
-		details: { kind: "completed", scope: "stage", runId, workflowName: "deploy", status: "running", stageId: "s1", stageName: "build" },
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
-	const record = b.records().find((r) => r.type === "workflow_lifecycle");
+	await b.hook(b.ev.run(runId, "running"));
+	await b.hook(b.ev.stage(runId, "s1", "build", "completed", "running"));
+	const record = b.records().find((r) => r.type === "workflow_lifecycle" && r.scope === "stage");
 	assert.equal(record.scope, "stage");
 	assert.equal(record.stageName, "build");
 	assert.equal(record.terminal, false, "a stage completing must not end a run-level wait");

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { makeFakePi, makeBridgeCtx, readOutbox, untilOutbox } from "./helpers.mjs";
+import { makeFakePi, makeBridgeCtx, makeWorkflowEvents, readOutbox, untilOutbox } from "./helpers.mjs";
 
 // 0.3.1 contracts (ROADMAP TOP 5). Written red against the 0.3.0 baseline.
 // RELOAD_SETTLE_MS is shrunk through its test seam so run_workflow tests do
@@ -46,14 +46,11 @@ async function boot(t, { piOptions = {}, ctxOptions = {}, cwd } = {}) {
 	};
 }
 
-function startedNotice(runId, workflowName, entryId) {
-	return {
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		id: entryId,
-		content: `Workflow ${workflowName} started`,
-		details: { kind: "started", scope: "run", runId, workflowName, status: "running" },
-	};
+// A user-visible run start as Atomic delivers it: the run.start transcript
+// entry (workflow name) plus the typed hook (state).
+async function startRun(world, ctx, sessionId, runId, workflowName, entryId) {
+	ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: entryId, data: { runId, name: workflowName } });
+	await world.fire("workflow_lifecycle", makeWorkflowEvents(sessionId).run(runId, "running"), ctx);
 }
 
 const wfSource = 'export default workflow({ name: "x" });\n';
@@ -72,8 +69,7 @@ test("item1: pendingWorkflowLaunch does not survive a session switch", async (t)
 	t.after(() => b.world.fire("session_shutdown", { reason: "quit" }));
 
 	const runId = "0f0f0f0f-abcd-4ef0-9876-000011112222";
-	nextCtx.entries.push(startedNotice(runId, "ghost-flow", "e-leak-1"));
-	await b.world.fire("agent_start", {}, nextCtx);
+	await startRun(b.world, nextCtx, nextId, runId, "ghost-flow", "e-leak-1");
 	const records = readOutbox(path.join(bridgeRoot, nextId));
 	const lifecycle = records.find((r) => r.type === "workflow_lifecycle" && r.kind === "started");
 	assert.ok(lifecycle, "the user-launched run must still be registered");
@@ -101,8 +97,7 @@ test("item1: a failed launch injection disarms the pending launch", async (t) =>
 	// The user relaunches the same-named workflow by hand: it must not be
 	// attributed to the dead command.
 	const runId = "1a1a1a1a-abcd-4ef0-9876-333344445555";
-	b.ctx.entries.push(startedNotice(runId, "ghost", "e-fail-1"));
-	await b.world.fire("agent_start", {}, b.ctx);
+	await startRun(b.world, b.ctx, b.sessionId, runId, "ghost", "e-fail-1");
 	const lifecycle = b.records().find((r) => r.type === "workflow_lifecycle" && r.kind === "started");
 	assert.ok(lifecycle, "the manual run must still be registered");
 	assert.equal(lifecycle.owner, null, "a failed launch must disarm attribution");
@@ -162,26 +157,6 @@ function writeStatusFile(projDir, runs) {
 	fs.writeFileSync(file, JSON.stringify({ runs, notices: [], version: 3 }, null, 2));
 	return file;
 }
-
-test("item2: workflow heartbeat cards are mirrored as workflow_heartbeat records", async (t) => {
-	const b = await boot(t);
-	const runId = "3c3c3c3c-abcd-4ef0-9876-99990000aaaa";
-	b.ctx.entries.push(startedNotice(runId, "long-flow", "e-hb-0"));
-	await b.world.fire("agent_start", {}, b.ctx);
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:workflow-heartbeat",
-		id: "e-hb-1",
-		content: "long-flow still running (15m elapsed)",
-		details: { runId, workflowName: "long-flow", scheduledAt: Date.now() },
-	});
-	await b.world.fire("agent_settled", {}, b.ctx);
-	const hb = b.records().find((r) => r.type === "workflow_heartbeat");
-	assert.ok(hb, "the heartbeat card must be mirrored");
-	assert.equal(hb.runId, runId);
-	assert.equal(hb.workflowName, "long-flow");
-	assert.match(hb.text, /still running/);
-});
 
 test("item2: status merges the workflow statusFile when the project provides it", async () => {
 	const agentDir = makeAgentDir();
@@ -387,29 +362,6 @@ test("item4: outcome replay of a steer ignores innocuous foreign input", async (
 	assert.notEqual(outcome.state, "uncertain", "foreign input must not poison a non-prompt replay");
 });
 
-test("item4: a /reload does not re-emit already-mirrored workflow history", async (t) => {
-	const b = await boot(t);
-	const runId = "9c9c9c9c-abcd-4ef0-9876-aaaa1111bbbb";
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		id: "e-cursor-1",
-		content: "Workflow demo completed",
-		details: { kind: "completed", scope: "run", runId, workflowName: "demo", status: "completed" },
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
-	assert.equal(b.records().filter((r) => r.type === "workflow_lifecycle").length, 1);
-
-	// /reload: same session id, same entries, fresh extension state.
-	await b.world.fire("session_start", { reason: "reload" }, b.ctx);
-	await b.world.fire("agent_start", {}, b.ctx);
-	assert.equal(
-		b.records().filter((r) => r.type === "workflow_lifecycle").length,
-		1,
-		"the durable entry cursor must survive a reload",
-	);
-});
-
 // --- item 5: verified command surface --------------------------------------------
 
 test("item5: an unknown slash command is refused with the available names", async (t) => {
@@ -465,41 +417,6 @@ test("review: the binding table is capped at default TTLs — oldest evicted, na
 	}
 	const evicted = await b.until((r) => r.type === "binding_expired" && r.reason === "evicted");
 	assert.equal(evicted.id, "cap-00", "eviction must drop the oldest binding first and name it");
-});
-
-test("review: in-flight workflow tracking survives a reload into a FRESH extension instance", async (t) => {
-	const b = await boot(t);
-	const runId = "5a5a5a5a-abcd-4ef0-9876-cccc2222dddd";
-	b.ctx.entries.push(startedNotice(runId, "long-haul", "e-fresh-1"));
-	await b.world.fire("agent_start", {}, b.ctx);
-	b.drop({ id: "st-before", action: "status" });
-	const before = await b.until((r) => r.type === "status_report" && r.id === "st-before");
-	assert.deepEqual(before.pendingWorkflows, [runId]);
-
-	// A real /reload: the old instance is torn down FIRST (otherwise it keeps
-	// consuming the shared inbox and the test greenwashes itself), then a
-	// brand-new extension instance (new closure, empty knownRuns) starts on
-	// the same session dir with the same entries.
-	await b.world.fire("session_shutdown", { reason: "reload" });
-	const world2 = makeFakePi();
-	registerBridge(world2.pi);
-	await world2.fire("session_start", { reason: "reload" }, b.ctx);
-	t.after(() => world2.fire("session_shutdown", { reason: "quit" }));
-	const drop2 = (payload) => {
-		const file = `${String(Date.now()).padStart(14, "0")}-900-drop2.json`;
-		fs.writeFileSync(path.join(b.inboxDir, ".tmp", file), JSON.stringify(payload));
-		fs.renameSync(path.join(b.inboxDir, ".tmp", file), path.join(b.inboxDir, file));
-	};
-	drop2({ id: "st-after", action: "status" });
-	const after = await b.until((r) => r.type === "status_report" && r.id === "st-after");
-	assert.deepEqual(
-		after.pendingWorkflows,
-		[runId],
-		"the durable cursor must not skip past runs that are still in flight",
-	);
-	// And the cursor still prevents re-emission of the mirrored history.
-	await world2.fire("agent_start", {}, b.ctx);
-	assert.equal(b.records().filter((r) => r.type === "workflow_lifecycle").length, 1);
 });
 
 test("review: getCommands names with a leading slash still validate", async (t) => {

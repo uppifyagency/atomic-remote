@@ -201,3 +201,65 @@ export async function untilOutbox(sessionDir, predicate, { timeoutMs = BRIDGE_SA
 		await sleep(25);
 	}
 }
+
+// --- typed workflow hooks (Atomic >= 0.9.63) ----------------------------------
+// Shaped exactly like the payloads a live Atomic 0.9.64 TUI delivered
+// (fixtures/probe-0964-workflow-events.jsonl): same envelope keys, live
+// delivery, ownerSessionId = the owning TUI session.
+
+export function probeWorkflowEvents(ownerSessionId) {
+	const file = fileURLToPath(new URL("./fixtures/probe-0964-workflow-events.jsonl", import.meta.url));
+	return fs
+		.readFileSync(file, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line))
+		.map((event) =>
+			event.type === "workflow_activity_changed"
+				? { ...event, root: { ...event.root, ownerSessionId } }
+				: { ...event, ownerSessionId },
+		);
+}
+
+let workflowEventSeq = 0;
+
+export function makeWorkflowEvents(ownerSessionId) {
+	const envelope = (runId, target, { rootRunId = runId, delivery = "live", attribution = "user", eventId, owner } = {}) => ({
+		type: "workflow_lifecycle",
+		eventId: eventId ?? `ev-${process.pid}-${workflowEventSeq++}`,
+		runId,
+		rootRunId,
+		occurredAt: Date.now(),
+		observedAt: Date.now(),
+		target: { runId, ...target },
+		attribution,
+		delivery,
+		ownerSessionId: owner ?? ownerSessionId,
+		cursor: { epoch: "test-epoch", revision: workflowEventSeq },
+	});
+	return {
+		run: (runId, status, previousStatus, options = {}) =>
+			envelope(
+				runId,
+				{
+					kind: "run",
+					status,
+					...(previousStatus ? { previousStatus } : {}),
+					...(options.action ? { action: options.action } : {}),
+				},
+				options,
+			),
+		stage: (runId, stageId, stageName, status, previousStatus, options = {}) =>
+			envelope(runId, { kind: "stage", stageId, stageName, status, ...(previousStatus ? { previousStatus } : {}) }, options),
+		prompt: (runId, promptId, status, options = {}) =>
+			envelope(runId, { kind: "prompt", promptId, status, ...(options.stageId ? { stageId: options.stageId } : {}) }, options),
+		heartbeat: (runId, { rootRunId = runId, owner } = {}) => ({
+			type: "workflow_heartbeat",
+			runId,
+			rootRunId,
+			ownerSessionId: owner ?? ownerSessionId,
+			scheduledAt: Date.now(),
+			intervalMinutes: 15,
+		}),
+	};
+}
