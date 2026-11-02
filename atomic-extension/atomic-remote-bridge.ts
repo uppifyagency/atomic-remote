@@ -1,5 +1,5 @@
 /**
- * atomic-remote bridge v0.3.2 — Atomic-side half of the atomic-remote Claude Code plugin.
+ * atomic-remote bridge v0.9.64 — Atomic-side half of the atomic-remote Claude Code plugin.
  *
  * Install into ~/.atomic/agent/extensions/ (the plugin's /atomic-remote:setup command
  * does this), then run /reload inside the Atomic session.
@@ -57,7 +57,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.3.2";
+const BRIDGE_VERSION = "0.9.64";
 const PROTOCOL = 3;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;

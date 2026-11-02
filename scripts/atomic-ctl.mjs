@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * atomic-ctl v0.3.2 — Claude Code-side controller for the atomic-remote bridge.
+ * atomic-ctl v0.9.64 — Claude Code-side controller for the atomic-remote bridge.
  *
  * Usage: run with --help. The USAGE constant below is the single authoritative
  * command reference; this header deliberately does not duplicate it.
@@ -805,7 +805,7 @@ function newCommandId() {
 
 // --- main ---------------------------------------------------------------------
 
-const USAGE = `atomic-ctl v0.3.2 — command running Atomic sessions via the atomic-remote bridge
+const USAGE = `atomic-ctl v0.9.64 — command running Atomic sessions via the atomic-remote bridge
 
 Commands:
   list [--json] [--all]        Show sessions (live/stale; --all includes closed)
