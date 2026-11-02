@@ -2,7 +2,8 @@
 /**
  * rpc-run — one-shot headless Atomic run over the official RPC protocol
  * (see Atomic docs: rpc.md). Spawns `atomic --mode rpc --no-session`,
- * sends one prompt, streams the assistant text to stdout, exits on agent_end.
+ * sends one prompt, streams the assistant text to stdout, exits on agent_settled
+ * (or at once when an extension handled the prompt and no run started).
  *
  * Usage:
  *   rpc-run.mjs [--atomic <path-to-atomic>] [--model <provider/model>] [--timeout <s>] <prompt...>
@@ -70,17 +71,19 @@ function handleLine(line) {
 		process.stdout.write(event.assistantMessageEvent.delta);
 	}
 	if (event.type === "response" && event.success === false) {
-		// A rejected prompt never produces agent_end — terminate now, and loudly.
+		// A rejected prompt never produces agent_settled, so terminate now, and loudly.
 		console.error(`\nRPC error (${event.command}): ${event.error}`);
 		clearTimeout(timer);
 		child.kill();
 		process.exit(1);
 	}
-	if (event.type === "agent_end") {
+	const handled = event.type === "response" && event.command === "prompt" && event.data?.disposition === "handled";
+	// agent_end only closes one low-level run; a retry or compaction recovery can follow it.
+	if (handled || event.type === "agent_settled") {
 		if (printed) process.stdout.write("\n");
 		clearTimeout(timer);
 		child.kill();
-		// Keep exit 2 when this agent_end came from the timeout abort.
+		// Keep exit 2 when this settle came from the timeout abort.
 		process.exit(process.exitCode ?? 0);
 	}
 }

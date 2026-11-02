@@ -13,5 +13,5 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" outcome <target> <command-id
 
 Rules:
 - The command id is printed by `send` and `run-workflow` ("command id ..."); this replays outbox history through the same state machine `--wait` uses, so the answers cannot disagree.
-- Read `state` from the JSON: `completed` (report `text` as Atomic's reply), `working`/`pending` (still going, poll later, do NOT resend), `detached` (workflow still running, report `runId`), `failed` (report `text`; if `failedStageId` is present, a replan can target that stage), `aborted`, `uncertain` (report nothing as Atomic's reply).
+- Read `state` from the JSON: `completed` (report `text` as Atomic's reply), `working`/`pending` (still going, poll later, do NOT resend), `detached` (workflow still running, report `runId`), `failed` (report `text`; if `failedStageId` is present, a replan can target that stage), `aborted`, `uncertain` (report nothing as Atomic's reply), `awaiting_input` (a workflow stage waits on the human: report `runId`/`stageName` and unblock with `/atomic-remote:answer`).
 - Exit 4 means no outbox record mentions that command id in that session: re-check the id and the target before anything else.

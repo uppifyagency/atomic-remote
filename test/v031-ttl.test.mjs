@@ -3,7 +3,7 @@ import { test } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { makeFakePi, makeBridgeCtx, readOutbox, untilOutbox, sleep } from "./helpers.mjs";
+import { makeFakePi, makeBridgeCtx, makeWorkflowEvents, readOutbox, untilOutbox, sleep } from "./helpers.mjs";
 
 // Expiry of unclaimed attribution state (ROADMAP item 1). node --test runs
 // each file in its own process, so the tiny TTLs below cannot leak into the
@@ -43,6 +43,7 @@ async function boot(t, { cwd } = {}) {
 		ctx,
 		dir,
 		inboxDir,
+		ev: makeWorkflowEvents(sessionId),
 		drop(payload) {
 			const file = `${String(Date.now()).padStart(14, "0")}-${String(dropSeq++).padStart(3, "0")}-drop.json`;
 			fs.writeFileSync(path.join(inboxDir, ".tmp", file), JSON.stringify(payload));
@@ -106,20 +107,9 @@ test("an armed workflow launch expires loudly when no started notice ever arrive
 	);
 
 	// A later same-named run (user relaunch) must not inherit the dead owner.
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		id: "e-ttl-1",
-		content: "Workflow never-starts started",
-		details: {
-			kind: "started",
-			scope: "run",
-			runId: "2b2b2b2b-abcd-4ef0-9876-666677778888",
-			workflowName: "never-starts",
-			status: "running",
-		},
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
+	const runId = "2b2b2b2b-abcd-4ef0-9876-666677778888";
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-ttl-1", data: { runId, name: "never-starts" } });
+	await b.world.fire("workflow_lifecycle", b.ev.run(runId, "running"), b.ctx);
 	const lifecycle = b.records().find((r) => r.type === "workflow_lifecycle" && r.kind === "started");
 	assert.equal(lifecycle?.owner, null);
 	assert.equal(

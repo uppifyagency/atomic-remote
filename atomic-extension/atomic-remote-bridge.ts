@@ -1,5 +1,5 @@
 /**
- * atomic-remote bridge v0.3.2 — Atomic-side half of the atomic-remote Claude Code plugin.
+ * atomic-remote bridge v0.9.64 — Atomic-side half of the atomic-remote Claude Code plugin.
  *
  * Install into ~/.atomic/agent/extensions/ (the plugin's /atomic-remote:setup command
  * does this), then run /reload inside the Atomic session.
@@ -25,9 +25,10 @@
  *   - "run_workflow" installs a workflow TS into <cwd>/.atomic/workflows/,
  *     injects /workflow reload then /workflow <name> (deterministic entry);
  *     emits workflow_installed {targetPath, overwrote}
- *   - workflow lifecycle is mirrored structurally from custom_message entries
- *     (customType "workflows:lifecycle-notice"): workflow_lifecycle records now
- *     carry scope/workflowName/status/stage fields; terminal only for run scope
+ *   - workflow lifecycle is mirrored from Atomic's typed workflow_lifecycle and
+ *     workflow_heartbeat hooks (published since Atomic 0.9.19):
+ *     workflow_lifecycle records carry scope/workflowName/status/stage fields;
+ *     terminal only for run scope
  *   - status_report busy/idle come from one source of truth (engine isIdle)
  *
  * Protocol guarantees (v2, unchanged unless noted):
@@ -56,7 +57,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.3.2";
+const BRIDGE_VERSION = "0.9.64";
 const PROTOCOL = 3;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -94,19 +95,14 @@ const OUTBOX_MAX_BYTES = envMs("ATOMIC_REMOTE_OUTBOX_MAX_BYTES", 8 * 1024 * 1024
 // agent_start/agent_end but no agent_settled. Once the engine is idle past
 // this grace, the bridge settles that turn itself.
 const INTERRUPT_SETTLE_GRACE_MS = envMs("ATOMIC_REMOTE_INTERRUPT_SETTLE_GRACE_MS", 1_500);
-const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
 // Controller filenames are <ts:14>-<seq:3>-<id>.json; anything else yields id=null.
 const PROCESSING_ID_PATTERN = /^\d{14}-\d{3}-([A-Za-z0-9_-]{1,64})\.json\.processing$/;
-const WORKFLOW_LIFECYCLE_CUSTOM_TYPE = "workflows:lifecycle-notice";
-// Heartbeat cards arrive at most once per heartbeatIntervalMinutes (15 min
-// default) per run: mirroring them keeps the outbox low-cardinality while
-// feeding the controller's idle timeout during long silent runs.
-const WORKFLOW_HEARTBEAT_CUSTOM_TYPE = "workflows:workflow-heartbeat";
-// terminal is true only for run-scope terminal kinds: a stage completing must not
-// end a controller's wait for the whole run.
-const WORKFLOW_TERMINAL_KINDS: readonly string[] = ["completed", "failed", "blocked", "quit"];
+// A quit request ends in "paused" (resumable), which alone must not end a wait,
+// so the request itself is the terminal signal.
+const WORKFLOW_TERMINAL_STATUSES: readonly string[] = ["completed", "failed", "blocked", "cancelled", "killed", "skipped"];
+const SEEN_EVENT_CAP = 1024;
 
 type MessagelessAction = "ping" | "status" | "abort";
 type MessageAction = "prompt" | "steer" | "follow_up" | "interrupt" | "command";
@@ -116,16 +112,35 @@ type BridgeCommand =
 	| { action: MessageAction; id: string; message: string; plan?: Record<string, unknown> }
 	| { action: "run_workflow"; id: string; workflowName: string; workflowSource: string; args?: string };
 
-interface WorkflowLifecycleDetails {
-	kind?: string;
-	scope?: string;
-	runId?: string;
-	workflowName?: string;
-	status?: string;
-	stageId?: string;
-	stageName?: string;
-	failedStageId?: string;
-	error?: string;
+type WorkflowLifecycleTarget =
+	| { kind: "run"; runId: string; previousStatus?: string; status: string; action?: string }
+	| { kind: "stage"; runId: string; stageId: string; stageName: string; previousStatus?: string; status: string }
+	| { kind: "prompt"; runId: string; stageId?: string; promptId: string; status: "opened" | "answered" | "cancelled" }
+	| { kind: "tool" };
+
+interface WorkflowLifecycleEvent {
+	eventId: string;
+	runId: string;
+	rootRunId: string;
+	ownerSessionId: string;
+	delivery: "live" | "replay";
+	target: WorkflowLifecycleTarget;
+	attribution?: string;
+}
+
+interface WorkflowHeartbeatEvent {
+	runId: string;
+	rootRunId: string;
+	ownerSessionId: string;
+	intervalMinutes?: number;
+}
+
+interface RunState {
+	owner: string | null;
+	terminal: boolean;
+	workflowName: string | null;
+	stages: Map<string, { name: string; status: string }>;
+	waits: Map<string, { stageId: string | null; stageName: string | null }>;
 }
 
 interface RejectedCommand {
@@ -297,7 +312,6 @@ export default function (pi: ExtensionAPI) {
 	let outboxPath: string | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let safetyTimer: ReturnType<typeof setInterval> | undefined;
-	let workflowTimer: ReturnType<typeof setInterval> | undefined;
 	let outboxModeApplied = false;
 	let outboxApproxBytes = -1; // -1 = unknown; measured once, then tracked per append
 	// Total order across rotations and engine restarts: a millisecond base makes
@@ -336,17 +350,14 @@ export default function (pi: ExtensionAPI) {
 		interruptSettleTimer = undefined;
 	};
 
-	// Workflow tracking (roadmap #3).
-	const knownRuns = new Map<string, { owner: string | null; terminal: boolean }>();
-	let entryCursor = 0;
-	// Durable cursor: the id of the last scanned entry, persisted in meta.json.
-	// Entry ids are stable, so a /reload resumes where the previous extension
-	// instance stopped instead of re-emitting the whole mirrored history.
-	let lastEntryId: string | null = null;
+	const knownRuns = new Map<string, RunState>();
+	// Atomic fires these hooks for every run it publishes, not only this session's.
+	let ownSessionId: string | null = null;
+	const seenEventIds = new Set<string>();
 	// A slash-launched run never passes through the model's workflow tool (no
 	// tool_execution_end) and a handled slash command emits no input event, so
-	// run_workflow attribution binds via the run's own "started" notice, matched
-	// by workflow name.
+	// run_workflow attribution binds via the run's typed hooks, once the
+	// transcript names the run as the launched workflow.
 	let pendingWorkflowLaunch: { owner: string; workflowName: string; armedAt: number } | null = null;
 
 	// Expire unclaimed attribution state. Runs on every event that could
@@ -449,11 +460,9 @@ export default function (pi: ExtensionAPI) {
 		watcher = undefined;
 		if (heartbeatTimer) clearInterval(heartbeatTimer);
 		if (safetyTimer) clearInterval(safetyTimer);
-		if (workflowTimer) clearInterval(workflowTimer);
 		cancelInterruptSettle();
 		heartbeatTimer = undefined;
 		safetyTimer = undefined;
-		workflowTimer = undefined;
 	};
 
 	// Deliberately no automatic GC: the protocol guarantees nothing is deleted
@@ -461,121 +470,168 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Workflow lifecycle mirroring (roadmap #3) -------------------------
 
-	const hasPendingRuns = () => [...knownRuns.values()].some((run) => !run.terminal);
+	type SessionCtx = { sessionManager?: { getEntries?: () => unknown[] } };
 
-	// Structural mirroring: @bastani/workflows appends its lifecycle notices as
-	// custom_message entries with typed details. Reading those replaces the v2
-	// regex-over-JSON.stringify heuristic, whose false negatives degraded to
-	// exit-7 timeouts and whose false positives fired on assistant text quoting
-	// a runId near the word "completed".
-	const scanEntriesForWorkflows = (ctx: { sessionManager?: { getEntries?: () => unknown[] } }) => {
+	// The typed hooks are the state authority. The transcript is read only for
+	// what they do not carry: the workflow name (workflow.run.start entry) and a
+	// failure's error text (workflow.run.end entry). The engine appends both
+	// AFTER the store transition that publishes the hook (workflows engine/run.ts
+	// recordRunStart -> appendRunStart; executor-lifecycle.ts recordRunEnd ->
+	// appendRunEnd), so either may still be missing: enrichment, never state.
+	const runEntries = (ctx: SessionCtx, runId: string) => {
+		const found: { name?: string; ended?: boolean; error?: string } = {};
 		let entries: unknown[];
 		try {
 			entries = ctx.sessionManager?.getEntries?.() ?? [];
 		} catch {
-			return;
+			return found;
 		}
-		if (entryCursor === 0 && lastEntryId !== null) {
-			// Fresh extension instance on an existing session: resume after the
-			// last entry the previous instance scanned. Not found (new session,
-			// different tree) means scan from the top.
-			for (let i = entries.length - 1; i >= 0; i--) {
-				if ((entries[i] as { id?: unknown } | null)?.id === lastEntryId) {
-					entryCursor = i + 1;
-					break;
-				}
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i] as { type?: string; customType?: string; data?: Record<string, unknown> } | null;
+			if (entry?.type !== "custom" || String(entry.data?.runId ?? "").toLowerCase() !== runId) continue;
+			if (entry.customType === "workflow.run.start") {
+				found.ended ??= false; // a resumed run reuses its id
+				if (typeof entry.data?.name === "string") found.name ??= entry.data.name;
+			} else if (entry.customType === "workflow.run.end") {
+				found.ended ??= true;
+				if (typeof entry.data?.error === "string") found.error ??= entry.data.error;
 			}
 		}
-		for (; entryCursor < entries.length; entryCursor++) {
-			const entry = entries[entryCursor] as {
-				type?: string;
-				customType?: string;
-				details?: WorkflowLifecycleDetails;
-				content?: unknown;
-			} | null;
-			if (entry?.type !== "custom_message") continue;
-			if (entry.customType === WORKFLOW_HEARTBEAT_CUSTOM_TYPE) {
-				const heartbeat = entry.details as { runId?: unknown; workflowName?: unknown } | undefined;
-				if (typeof heartbeat?.runId !== "string") continue;
-				const hbRunId = heartbeat.runId.toLowerCase();
-				emit({
-					type: "workflow_heartbeat",
-					runId: hbRunId,
-					owner: knownRuns.get(hbRunId)?.owner ?? null,
-					workflowName: typeof heartbeat.workflowName === "string" ? heartbeat.workflowName : null,
-					text: typeof entry.content === "string" ? entry.content.slice(0, 500) : null,
-				});
-				continue;
-			}
-			if (entry.customType !== WORKFLOW_LIFECYCLE_CUSTOM_TYPE) continue;
-			const details = entry.details;
-			if (!details || typeof details.runId !== "string" || typeof details.kind !== "string") continue;
-			const runId = details.runId.toLowerCase();
-			let run = knownRuns.get(runId);
-			if (!run) {
-				// First sight via a lifecycle notice (tool event missed, or the run
-				// was started by the user): register it so status can report it.
-				run = { owner: null, terminal: false };
-				if (
-					pendingWorkflowLaunch !== null &&
-					details.kind === "started" &&
-					details.scope !== "stage" &&
-					details.workflowName === pendingWorkflowLaunch.workflowName
-				) {
-					run.owner = pendingWorkflowLaunch.owner;
-					pendingWorkflowLaunch = null;
-					emit({ type: "workflow_started", runId, owner: run.owner });
-				}
-				knownRuns.set(runId, run);
-			}
-			const scope = details.scope === "stage" ? "stage" : "run";
-			const terminal = scope === "run" && WORKFLOW_TERMINAL_KINDS.includes(details.kind);
-			if (terminal) run.terminal = true;
-			emit({
-				type: "workflow_lifecycle",
-				runId,
-				kind: details.kind,
-				terminal,
-				owner: run.owner,
-				scope,
-				workflowName: details.workflowName ?? null,
-				status: details.status ?? null,
-				...(details.stageId ? { stageId: details.stageId } : {}),
-				...(details.stageName ? { stageName: details.stageName } : {}),
-				...(details.failedStageId ? { failedStageId: details.failedStageId } : {}),
-				...(details.error ? { error: String(details.error).slice(0, 2000) } : {}),
-				text: typeof entry.content === "string" ? entry.content.slice(0, 2000) : null,
-			});
-		}
-		if (entries.length > 0) {
-			const tailId = (entries[entries.length - 1] as { id?: unknown } | null)?.id;
-			if (typeof tailId === "string" && tailId !== lastEntryId) {
-				lastEntryId = tailId;
-				// In-flight runs must survive alongside the cursor: a fresh instance
-				// that resumes after lastEntryId never re-reads their notices, so
-				// without this it would report no pendingWorkflows after a /reload
-				// and settle non-provisionally while a run is still alive.
-				writeMeta({
-					lastEntryId,
-					pendingRuns: [...knownRuns.entries()]
-						.filter(([, run]) => !run.terminal)
-						.map(([runId, run]) => ({ runId, owner: run.owner })),
-				});
-			}
-		}
+		return found;
 	};
 
-	const ensureWorkflowTimer = (ctx: { sessionManager?: { getEntries?: () => unknown[] } }) => {
-		if (workflowTimer || !hasPendingRuns()) return;
-		workflowTimer = setInterval(() => {
-			scanEntriesForWorkflows(ctx);
-			if (!hasPendingRuns() && workflowTimer) {
-				clearInterval(workflowTimer);
-				workflowTimer = undefined;
-			}
-		}, WORKFLOW_SCAN_MS);
-		workflowTimer.unref?.();
+	// Survives /reload: Atomic never re-delivers lifecycle hooks to a fresh
+	// extension instance (runner retirement fences them, and store recovery
+	// suppresses lifecycle for runs it did not see go live), so without this a
+	// reloaded bridge would report no pendingWorkflows (or open waits) while a
+	// run is alive.
+	const persistPendingRuns = () => {
+		writeMeta({
+			pendingRuns: [...knownRuns.entries()]
+				.filter(([, run]) => !run.terminal)
+				.map(([runId, run]) => ({
+					runId,
+					owner: run.owner,
+					workflowName: run.workflowName,
+					waits: [...run.waits].map(([waitId, wait]) => ({ waitId, ...wait })),
+				})),
+		});
 	};
+
+	const firstSight = (runId: string): RunState => {
+		const run: RunState = { owner: null, terminal: false, workflowName: null, stages: new Map(), waits: new Map() };
+		knownRuns.set(runId, run);
+		persistPendingRuns();
+		return run;
+	};
+
+	// Atomic publishes a run's first hook before it appends workflow.run.start,
+	// so the name is retried on each event until the entry lands. A pending
+	// launch binds only once that name is known and is the launched one.
+	const learnName = (runId: string, run: RunState, attribution: string | undefined, ctx: SessionCtx) => {
+		const name = runEntries(ctx, runId).name;
+		if (name === undefined) return;
+		run.workflowName = name;
+		const launch = pendingWorkflowLaunch;
+		const launchable = attribution === undefined || attribution === "user" || attribution === "unknown";
+		if (launch !== null && run.owner === null && launchable && name === launch.workflowName) {
+			run.owner = launch.owner;
+			pendingWorkflowLaunch = null;
+			emit({ type: "workflow_started", runId, owner: run.owner });
+		}
+		persistPendingRuns();
+	};
+
+	const runKind = (target: Extract<WorkflowLifecycleTarget, { kind: "run" }>): string => {
+		if (target.action !== undefined) return target.action;
+		if (target.status !== "running") return target.status;
+		if (target.previousStatus === "paused") return "resumed";
+		return target.previousStatus === undefined || target.previousStatus === "pending" ? "started" : "running";
+	};
+
+	pi.on("workflow_lifecycle", async (event, ctx) => {
+		const lifecycle = event as unknown as WorkflowLifecycleEvent;
+		if (!outboxPath || lifecycle.delivery !== "live") return;
+		if (ownSessionId !== null && lifecycle.ownerSessionId !== ownSessionId) return;
+		if (seenEventIds.has(lifecycle.eventId)) return;
+		seenEventIds.add(lifecycle.eventId);
+		if (seenEventIds.size > SEEN_EVENT_CAP) seenEventIds.delete(seenEventIds.values().next().value as string);
+		const target = lifecycle.target;
+		if (target.kind === "tool") return;
+		sweepPendingState();
+		const runId = lifecycle.rootRunId.toLowerCase();
+		const run = knownRuns.get(runId) ?? firstSight(runId);
+		if (run.workflowName === null) learnName(runId, run, lifecycle.attribution, ctx as SessionCtx);
+		// Atomic keeps the question text out of these hooks; it lives only in statusFile.
+		const setWait = (waitId: string, open: boolean, stageId: string | null, stageName: string | null) => {
+			if (open === run.waits.has(waitId)) return;
+			const wait = run.waits.get(waitId) ?? { stageId, stageName };
+			if (open) run.waits.set(waitId, wait);
+			else run.waits.delete(waitId);
+			persistPendingRuns();
+			emit({ type: open ? "workflow_awaiting_input" : "workflow_input_resolved", runId, waitId, ...wait, owner: run.owner });
+		};
+		if (target.kind === "prompt") {
+			// A stage question publishes both the stage's awaiting_input and this
+			// prompt (recordStagePendingPrompt sets both), so they share one wait id.
+			// A nested child's run-level prompt folds into the root with no stageId.
+			const stageId = target.stageId ?? null;
+			const waitId = stageId ? `stage:${stageId}` : `prompt:${target.promptId}`;
+			setWait(waitId, target.status === "opened", stageId, stageId ? (run.stages.get(stageId)?.name ?? null) : null);
+			return;
+		}
+		const base = {
+			type: "workflow_lifecycle",
+			runId,
+			owner: run.owner,
+			workflowName: run.workflowName,
+			status: target.status,
+			...(target.previousStatus ? { previousStatus: target.previousStatus } : {}),
+		};
+		if (target.kind === "stage") {
+			run.stages.set(target.stageId, { name: target.stageName, status: target.status });
+			emit({ ...base, kind: target.status, terminal: false, scope: "stage", stageId: target.stageId, stageName: target.stageName, text: null });
+			setWait(`stage:${target.stageId}`, target.status === "awaiting_input", target.stageId, target.stageName);
+			return;
+		}
+		if (lifecycle.runId.toLowerCase() !== runId) return;
+		const kind = runKind(target);
+		const terminal = WORKFLOW_TERMINAL_STATUSES.includes(target.status) || target.action === "quit";
+		const wasTerminal = run.terminal;
+		if (terminal) {
+			run.terminal = true;
+			run.waits.clear();
+		} else if (target.status === "running" && target.action === undefined) run.terminal = false;
+		const failedStage =
+			target.status === "failed" ? [...run.stages].reverse().find(([, stage]) => stage.status === "failed") : undefined;
+		const error = target.status === "failed" || target.status === "blocked" ? runEntries(ctx as SessionCtx, runId).error : undefined;
+		emit({
+			...base,
+			kind,
+			terminal,
+			scope: "run",
+			...(failedStage ? { failedStageId: failedStage[0], stageId: failedStage[0], stageName: failedStage[1].name } : {}),
+			...(error ? { error: error.slice(0, 2000) } : {}),
+			text: `Workflow ${run.workflowName ? `"${run.workflowName}" ` : ""}${kind} (run ${runId})${error ? `: ${error.slice(0, 500)}` : ""}`,
+		});
+		if (run.terminal !== wasTerminal) persistPendingRuns();
+	});
+
+	pi.on("workflow_heartbeat", async (event) => {
+		const heartbeat = event as unknown as WorkflowHeartbeatEvent;
+		if (!outboxPath) return;
+		if (ownSessionId !== null && heartbeat.ownerSessionId !== ownSessionId) return;
+		const runId = heartbeat.rootRunId.toLowerCase();
+		const run = knownRuns.get(runId);
+		emit({
+			type: "workflow_heartbeat",
+			runId,
+			owner: run?.owner ?? null,
+			workflowName: run?.workflowName ?? null,
+			intervalMinutes: heartbeat.intervalMinutes ?? null,
+			text: null,
+		});
+	});
 
 	// --- Command handling (roadmap #4: serial, validated, at-least-once) ---
 
@@ -638,6 +694,9 @@ export default function (pi: ExtensionAPI) {
 						pendingWorkflows: [...knownRuns.entries()]
 							.filter(([, run]) => !run.terminal)
 							.map(([runId]) => runId),
+						awaitingInput: [...knownRuns.entries()].flatMap(([runId, run]) =>
+							[...run.waits].map(([waitId, wait]) => ({ runId, waitId, ...wait })),
+						),
 						protocol: PROTOCOL,
 						bridgeVersion: BRIDGE_VERSION,
 						...(cmd.include?.includes("commands") ? { commands: knownCommandNames(pi) ?? [] } : {}),
@@ -905,7 +964,7 @@ export default function (pi: ExtensionAPI) {
 		foreignSinceLastSettle = false;
 		lastTextForOwner = null;
 		knownRuns.clear();
-		entryCursor = 0;
+		ownSessionId = null;
 		agentRunning = false;
 		outboxApproxBytes = -1;
 
@@ -937,24 +996,27 @@ export default function (pi: ExtensionAPI) {
 		outboxPath = path.join(sessionDir, "outbox.jsonl");
 		outboxModeApplied = false;
 		fs.mkdirSync(path.join(inboxDir, ".tmp"), { recursive: true, mode: 0o700 });
-		// Resume the durable entry cursor left by a previous instance of this
-		// same session (reload / engine replacement); a new session dir has none.
-		lastEntryId = ((): string | null => {
-			const previous = readMeta()?.lastEntryId;
-			return typeof previous === "string" ? previous : null;
-		})();
-		// Rebuild the in-flight runs the previous instance was tracking: the
-		// resumed cursor deliberately skips their already-mirrored notices.
-		if (lastEntryId !== null) {
-			const persisted = readMeta()?.pendingRuns;
-			if (Array.isArray(persisted)) {
-				for (const item of persisted) {
-					const runId = (item as { runId?: unknown } | null)?.runId;
-					if (typeof runId !== "string") continue;
-					const owner = (item as { owner?: unknown }).owner;
-					knownRuns.set(runId, { owner: typeof owner === "string" ? owner : null, terminal: false });
-				}
+		ownSessionId = sessionId;
+		const persisted = readMeta()?.pendingRuns;
+		if (Array.isArray(persisted)) {
+			for (const item of persisted) {
+				const runId = (item as { runId?: unknown } | null)?.runId;
+				if (typeof runId !== "string" || runEntries(ctx, runId).ended) continue;
+				const { owner, workflowName, waits } = item as { owner?: unknown; workflowName?: unknown; waits?: unknown };
+				const stringOrNull = (value: unknown) => (typeof value === "string" ? value : null);
+				knownRuns.set(runId, {
+					owner: stringOrNull(owner),
+					terminal: false,
+					workflowName: stringOrNull(workflowName),
+					stages: new Map(),
+					waits: new Map(
+						(Array.isArray(waits) ? waits : [])
+							.filter((wait) => typeof wait?.waitId === "string")
+							.map((wait) => [wait.waitId, { stageId: stringOrNull(wait.stageId), stageName: stringOrNull(wait.stageName) }] as const),
+					),
+				});
 			}
+			persistPendingRuns();
 		}
 		try {
 			fs.chmodSync(bridgeRoot, 0o700);
@@ -1062,7 +1124,6 @@ export default function (pi: ExtensionAPI) {
 			emit({ type: "turn_bound", id: activeOwner, via: "interrupt" });
 		}
 		writeHeartbeat();
-		scanEntriesForWorkflows(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
 		emit({ type: "agent_start", owner: activeOwner });
 	});
 
@@ -1101,7 +1162,6 @@ export default function (pi: ExtensionAPI) {
 		cancelInterruptSettle();
 		agentRunning = false;
 		writeHeartbeat();
-		scanEntriesForWorkflows(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
 		const pendingWork = [...knownRuns.entries()]
 			.filter(([, run]) => !run.terminal)
 			.map(([runId]) => ({ kind: "workflow", runId }));
@@ -1113,7 +1173,6 @@ export default function (pi: ExtensionAPI) {
 			...extra,
 			...(pendingWork.length > 0 ? { provisional: true, pendingWork } : {}),
 		});
-		ensureWorkflowTimer(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
 		activeOwner = null;
 		interruptTurnOwner = null;
 		// An interrupt binding that never claimed a turn is stale once the session
@@ -1181,11 +1240,13 @@ export default function (pi: ExtensionAPI) {
 				// Registered first via a lifecycle notice: the tool result is the
 				// attribution authority, so claim it for the active command.
 				existing.owner = activeOwner;
+				persistPendingRuns();
 				emit({ type: "workflow_started", runId, owner: activeOwner });
 			}
 			return;
 		}
-		knownRuns.set(runId, { owner: activeOwner, terminal: false });
+		knownRuns.set(runId, { owner: activeOwner, terminal: false, workflowName: null, stages: new Map(), waits: new Map() });
+		persistPendingRuns();
 		emit({ type: "workflow_started", runId, owner: activeOwner });
 	});
 

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { makeFakePi, makeBridgeCtx, readOutbox, untilOutbox, sleep } from "./helpers.mjs";
+import { makeFakePi, makeBridgeCtx, makeWorkflowEvents, readOutbox, untilOutbox, sleep } from "./helpers.mjs";
 
 // The bridge reads ATOMIC_CODING_AGENT_DIR once at module load; set it first.
 process.env.ATOMIC_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-bridge-test-"));
@@ -266,7 +266,7 @@ test("attribution: interrupt on a busy session preempts the bound owner and clai
 	assert.equal(settles[1].text, "INTERRUPT-VISTO-OK");
 });
 
-test("workflows: launch detected, settle goes provisional, lifecycle mirrored from entries", async (t) => {
+test("workflows: launch detected, settle goes provisional, lifecycle mirrored from typed hooks", async (t) => {
 	const b = await boot(t);
 	const runId = "12345678-abcd-4ef0-9876-1234567890ab";
 	b.drop({ id: "wf-1", action: "prompt", message: "start the workflow" });
@@ -287,13 +287,7 @@ test("workflows: launch detected, settle goes provisional, lifecycle mirrored fr
 	assert.equal(settle.provisional, true);
 	assert.deepEqual(settle.pendingWork, [{ kind: "workflow", runId }]);
 
-	b.ctx.entries.push({
-		type: "custom_message",
-		customType: "workflows:lifecycle-notice",
-		content: `Workflow demo completed`,
-		details: { kind: "completed", scope: "run", runId, workflowName: "demo", status: "completed" },
-	});
-	await b.world.fire("agent_start", {}, b.ctx);
+	await b.world.fire("workflow_lifecycle", makeWorkflowEvents(b.sessionId).run(runId, "completed", "running"), b.ctx);
 	const lifecycle = b.records().find((r) => r.type === "workflow_lifecycle");
 	assert.equal(lifecycle.runId, runId);
 	assert.equal(lifecycle.kind, "completed");

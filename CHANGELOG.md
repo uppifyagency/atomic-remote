@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.9.64] - 2026-11-02
+
+Tested live against Atomic 0.9.64. From this release the plugin version tracks
+the Atomic release it was tested against live, so 0.3.2 is followed by 0.9.64.
+Minimum supported Atomic: 0.9.63 (the typed workflow hooks and the transcript
+entries the bridge reads were checked against its source; older releases are not
+verified). Protocol stays 3: the new record types and the `awaitingInput` status
+field are additive.
+
+### Changed
+- **Workflow tracking reads Atomic's typed hooks.** The bridge subscribes to
+  `workflow_lifecycle` and `workflow_heartbeat`, keeps only events owned by its
+  own session with `delivery: "live"`, and drops a re-delivered `eventId`. It
+  emits the same `workflow_started` / `workflow_lifecycle` / `workflow_heartbeat`
+  records as before, now with every stage transition. The 5 s transcript scan
+  and its entry cursor are gone, so a project that turns workflow chat notices
+  off is still tracked. The transcript is read only on demand, for what the
+  hooks do not carry: the workflow name (`workflow.run.start`) and a failure's
+  error text (`workflow.run.end`). Atomic appends the start entry after the
+  run's first hook, so the name is looked up again on each later event until it
+  is known, and a pending `run-workflow` launch claims a run only once its name
+  is known and matches.
+- A nested child workflow reports its stages on the root run and is never a
+  pending run of its own. A quit run is terminal; resuming it makes it pending
+  again.
+
+### Added
+- **Human-input waits end `--wait` promptly with exit 8.** When a stage asks the
+  human, the bridge emits `workflow_awaiting_input {runId, waitId, stageId,
+  stageName, owner}`, and `workflow_input_resolved` with the same `waitId` once
+  answered. `waitId` names one open question: `stage:<stageId>` for a stage
+  question (Atomic publishes it both as the stage's `awaiting_input` and as a
+  prompt, reported once), `prompt:<promptId>` for a run-level prompt, so two
+  open prompts in one run (a root and its nested child) stay two waits. Open
+  waits are persisted with the pending runs, so they survive `/reload` and the
+  answer given after it still emits `workflow_input_resolved`. `send`, `run-workflow`
+  and `answer` with `--wait` return at once with exit 8 and state
+  `awaiting_input`, naming the run and the `answer` command. Before, the wait
+  sat silent and ended after the 120 s idle timeout as exit 7 unless the project
+  had `statusFile: true` (reproduced live 3/3). With a statusFile the message
+  and `outcome` also carry the question and its option labels. `status` lists
+  open waits, each with its `waitId`, under `awaitingInput`.
+- **`answer` accepts a unique 8-hex run-id prefix**, as Atomic does. The prefix
+  resolves against the runs the session's bridge has reported; an ambiguous or
+  unknown prefix exits 4 and delivers nothing.
+
+### Fixed
+- After `/reload`, a run that ended during the reload gap is no longer reported
+  as pending forever: Atomic does not re-deliver lifecycle hooks to the new
+  extension instance, so the bridge retires persisted runs that already have a
+  `workflow.run.end` entry.
+- **`rpc-run` exits on `agent_settled`, not the first `agent_end`.** Atomic's
+  `agent_end` closes one low-level run, and a retry or compaction recovery can
+  follow it (docs `json.md`), so `rpc-run` could cut the answer short. It now
+  streams until `agent_settled`. A prompt whose response has
+  `disposition: "handled"` (an extension command or input handler consumed it,
+  so no run starts) exits 0 at once instead of waiting for the timeout.
+
 ## [0.3.2] - 2026-11-02
 
 Atomic 0.9.63 compatibility, from a live end-to-end run against a 0.9.63 TUI
