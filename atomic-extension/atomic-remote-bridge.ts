@@ -356,8 +356,8 @@ export default function (pi: ExtensionAPI) {
 	const seenEventIds = new Set<string>();
 	// A slash-launched run never passes through the model's workflow tool (no
 	// tool_execution_end) and a handled slash command emits no input event, so
-	// run_workflow attribution binds via the run's typed first sight, checked
-	// against the workflow name when the transcript already records it.
+	// run_workflow attribution binds via the run's typed hooks, once the
+	// transcript names the run as the launched workflow.
 	let pendingWorkflowLaunch: { owner: string; workflowName: string; armedAt: number } | null = null;
 
 	// Expire unclaimed attribution state. Runs on every event that could
@@ -518,19 +518,28 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	const firstSight = (runId: string, attribution: string | undefined, ctx: SessionCtx): RunState => {
-		const run: RunState = { owner: null, terminal: false, workflowName: runEntries(ctx, runId).name ?? null, stages: new Map(), waits: new Map() };
-		const launch = pendingWorkflowLaunch;
-		const launchable = attribution === undefined || attribution === "user" || attribution === "unknown";
-		if (launch !== null && launchable && (run.workflowName ?? launch.workflowName) === launch.workflowName) {
-			run.owner = launch.owner;
-			run.workflowName = launch.workflowName;
-			pendingWorkflowLaunch = null;
-			emit({ type: "workflow_started", runId, owner: run.owner });
-		}
+	const firstSight = (runId: string): RunState => {
+		const run: RunState = { owner: null, terminal: false, workflowName: null, stages: new Map(), waits: new Map() };
 		knownRuns.set(runId, run);
 		persistPendingRuns();
 		return run;
+	};
+
+	// Atomic publishes a run's first hook before it appends workflow.run.start,
+	// so the name is retried on each event until the entry lands. A pending
+	// launch binds only once that name is known and is the launched one.
+	const learnName = (runId: string, run: RunState, attribution: string | undefined, ctx: SessionCtx) => {
+		const name = runEntries(ctx, runId).name;
+		if (name === undefined) return;
+		run.workflowName = name;
+		const launch = pendingWorkflowLaunch;
+		const launchable = attribution === undefined || attribution === "user" || attribution === "unknown";
+		if (launch !== null && run.owner === null && launchable && name === launch.workflowName) {
+			run.owner = launch.owner;
+			pendingWorkflowLaunch = null;
+			emit({ type: "workflow_started", runId, owner: run.owner });
+		}
+		persistPendingRuns();
 	};
 
 	const runKind = (target: Extract<WorkflowLifecycleTarget, { kind: "run" }>): string => {
@@ -551,7 +560,8 @@ export default function (pi: ExtensionAPI) {
 		if (target.kind === "tool") return;
 		sweepPendingState();
 		const runId = lifecycle.rootRunId.toLowerCase();
-		const run = knownRuns.get(runId) ?? firstSight(runId, lifecycle.attribution, ctx as SessionCtx);
+		const run = knownRuns.get(runId) ?? firstSight(runId);
+		if (run.workflowName === null) learnName(runId, run, lifecycle.attribution, ctx as SessionCtx);
 		// Atomic keeps the question text out of these hooks; it lives only in statusFile.
 		const setWait = (waitId: string, open: boolean, stageId: string | null, stageName: string | null) => {
 			if (open === run.waits.has(waitId)) return;
@@ -993,16 +1003,16 @@ export default function (pi: ExtensionAPI) {
 				const runId = (item as { runId?: unknown } | null)?.runId;
 				if (typeof runId !== "string" || runEntries(ctx, runId).ended) continue;
 				const { owner, workflowName, waits } = item as { owner?: unknown; workflowName?: unknown; waits?: unknown };
-				const nameOrNull = (value: unknown) => (typeof value === "string" ? value : null);
+				const stringOrNull = (value: unknown) => (typeof value === "string" ? value : null);
 				knownRuns.set(runId, {
-					owner: nameOrNull(owner),
+					owner: stringOrNull(owner),
 					terminal: false,
-					workflowName: nameOrNull(workflowName),
+					workflowName: stringOrNull(workflowName),
 					stages: new Map(),
 					waits: new Map(
 						(Array.isArray(waits) ? waits : [])
 							.filter((wait) => typeof wait?.waitId === "string")
-							.map((wait) => [wait.waitId, { stageId: nameOrNull(wait.stageId), stageName: nameOrNull(wait.stageName) }]),
+							.map((wait) => [wait.waitId, { stageId: stringOrNull(wait.stageId), stageName: stringOrNull(wait.stageName) }] as const),
 					),
 				});
 			}

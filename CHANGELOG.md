@@ -18,7 +18,10 @@ field are additive.
   and its entry cursor are gone, so a project that turns workflow chat notices
   off is still tracked. The transcript is read only on demand, for what the
   hooks do not carry: the workflow name (`workflow.run.start`) and a failure's
-  error text (`workflow.run.end`).
+  error text (`workflow.run.end`). Atomic appends the start entry after the
+  run's first hook, so the name is looked up again on each later event until it
+  is known, and a pending `run-workflow` launch claims a run only once its name
+  is known and matches.
 - A nested child workflow reports its stages on the root run and is never a
   pending run of its own. A quit run is terminal; resuming it makes it pending
   again.

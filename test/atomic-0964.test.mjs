@@ -233,6 +233,38 @@ test("run_workflow: a run of a different workflow started meanwhile is not claim
 	assert.equal(b.records().find((r) => r.type === "workflow_started" && r.runId === mine)?.owner, "wf-other");
 });
 
+test("workflowName is learned on a later event when the start entry lands after the first hook", async (t) => {
+	const b = await boot(t);
+	const runId = "0a0a0a0a-abcd-4ef0-9876-000000000023";
+	await b.hook(b.ev.run(runId, "running"));
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-late", data: { runId, name: "deploy" } });
+	await b.hook(b.ev.stage(runId, "s1", "build", "running", "pending"));
+	await b.hook(b.ev.run(runId, "completed", "running"));
+	assert.deepEqual(b.lifecycles().map((r) => r.workflowName), [null, "deploy", "deploy"]);
+	assert.match(b.lifecycles().at(-1).text, /"deploy"/);
+});
+
+test("run_workflow: with the real hook-then-entry order, a different workflow is not claimed and the launched one is", async (t) => {
+	const targetCwd = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-wf-"));
+	const b = await boot(t, { cwd: targetCwd });
+	b.drop({ id: "wf-late", action: "run_workflow", workflowName: "demo-flow", workflowSource: "// x\n" });
+	await b.until((r) => r.type === "accepted" && r.id === "wf-late");
+	const other = "0a0a0a0a-abcd-4ef0-9876-000000000024";
+	await b.hook(b.ev.run(other, "running"));
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-l2", data: { runId: other, name: "hand-made" } });
+	await b.hook(b.ev.stage(other, "s1", "build", "running", "pending"));
+	assert.equal(b.records().some((r) => r.type === "workflow_started"), false, "hand-made must not be claimed by wf-late");
+	const mine = "0a0a0a0a-abcd-4ef0-9876-000000000025";
+	await b.hook(b.ev.run(mine, "running"));
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-l3", data: { runId: mine, name: "demo-flow" } });
+	await b.hook(b.ev.stage(mine, "s1", "build", "running", "pending"));
+	assert.deepEqual(
+		b.records().filter((r) => r.type === "workflow_started").map((r) => [r.runId, r.owner]),
+		[[mine, "wf-late"]],
+	);
+	assert.equal(b.lifecycles().at(-1).owner, "wf-late");
+});
+
 test("run_workflow: an agent-launched run is left to the workflow tool's attribution", async (t) => {
 	const targetCwd = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-wf-"));
 	const b = await boot(t, { cwd: targetCwd });
