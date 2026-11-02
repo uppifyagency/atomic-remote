@@ -503,12 +503,18 @@ export default function (pi: ExtensionAPI) {
 	// Survives /reload: Atomic never re-delivers lifecycle hooks to a fresh
 	// extension instance (runner retirement fences them, and store recovery
 	// suppresses lifecycle for runs it did not see go live), so without this a
-	// reloaded bridge would report no pendingWorkflows while a run is alive.
+	// reloaded bridge would report no pendingWorkflows (or open waits) while a
+	// run is alive.
 	const persistPendingRuns = () => {
 		writeMeta({
 			pendingRuns: [...knownRuns.entries()]
 				.filter(([, run]) => !run.terminal)
-				.map(([runId, run]) => ({ runId, owner: run.owner, workflowName: run.workflowName })),
+				.map(([runId, run]) => ({
+					runId,
+					owner: run.owner,
+					workflowName: run.workflowName,
+					waits: [...run.waits].map(([waitId, wait]) => ({ waitId, ...wait })),
+				})),
 		});
 	};
 
@@ -552,6 +558,7 @@ export default function (pi: ExtensionAPI) {
 			const wait = run.waits.get(waitId) ?? { stageId, stageName };
 			if (open) run.waits.set(waitId, wait);
 			else run.waits.delete(waitId);
+			persistPendingRuns();
 			emit({ type: open ? "workflow_awaiting_input" : "workflow_input_resolved", runId, waitId, ...wait, owner: run.owner });
 		};
 		if (target.kind === "prompt") {
@@ -985,13 +992,18 @@ export default function (pi: ExtensionAPI) {
 			for (const item of persisted) {
 				const runId = (item as { runId?: unknown } | null)?.runId;
 				if (typeof runId !== "string" || runEntries(ctx, runId).ended) continue;
-				const { owner, workflowName } = item as { owner?: unknown; workflowName?: unknown };
+				const { owner, workflowName, waits } = item as { owner?: unknown; workflowName?: unknown; waits?: unknown };
+				const nameOrNull = (value: unknown) => (typeof value === "string" ? value : null);
 				knownRuns.set(runId, {
-					owner: typeof owner === "string" ? owner : null,
+					owner: nameOrNull(owner),
 					terminal: false,
-					workflowName: typeof workflowName === "string" ? workflowName : null,
+					workflowName: nameOrNull(workflowName),
 					stages: new Map(),
-					waits: new Map(),
+					waits: new Map(
+						(Array.isArray(waits) ? waits : [])
+							.filter((wait) => typeof wait?.waitId === "string")
+							.map((wait) => [wait.waitId, { stageId: nameOrNull(wait.stageId), stageName: nameOrNull(wait.stageName) }]),
+					),
 				});
 			}
 			persistPendingRuns();

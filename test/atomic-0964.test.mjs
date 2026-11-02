@@ -323,6 +323,34 @@ test("run-level prompts of a root and its nested child are separate waits; answe
 	assert.equal(outcome.exitCode, 8);
 });
 
+test("reload: an open wait survives, and the answer after the reload resolves it", async (t) => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-wf-"));
+	const b = await boot(t, { cwd });
+	b.drop({ id: "wf-reload", action: "run_workflow", workflowName: "demo-flow", workflowSource: "// x\n" });
+	await b.until((r) => r.type === "accepted" && r.id === "wf-reload");
+	const runId = "0a0a0a0a-abcd-4ef0-9876-000000000022";
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-rl", data: { runId, name: "demo-flow" } });
+	await b.hook(b.ev.run(runId, "running"));
+	await b.hook(b.ev.stage(runId, "s1", "ask", "running", "pending"));
+	await b.hook(b.ev.stage(runId, "s1", "ask", "awaiting_input", "running"));
+	const before = (await b.status("st-rw1")).awaitingInput;
+
+	await b.world.fire("session_shutdown", { reason: "reload" });
+	const world2 = makeFakePi();
+	registerBridge(world2.pi);
+	await world2.fire("session_start", { reason: "reload" }, b.ctx);
+	t.after(() => world2.fire("session_shutdown", { reason: "quit" }));
+	assert.deepEqual((await b.status("st-rw2")).awaitingInput, before);
+	assert.deepEqual(before, [{ runId, waitId: "stage:s1", stageId: "s1", stageName: "ask" }]);
+
+	await world2.fire("workflow_lifecycle", b.ev.stage(runId, "s1", "ask", "running", "awaiting_input"), b.ctx);
+	const resolved = b.records().filter((r) => r.type === "workflow_input_resolved");
+	assert.deepEqual(resolved.map((r) => [r.waitId, r.stageName, r.owner]), [["stage:s1", "ask", "wf-reload"]]);
+	assert.deepEqual((await b.status("st-rw3")).awaitingInput, []);
+	const outcome = JSON.parse((await runCtl(["outcome", b.sessionId, "wf-reload"], process.env.ATOMIC_CODING_AGENT_DIR)).stdout);
+	assert.notEqual(outcome.state, "awaiting_input", "the stage is running again after the answer");
+});
+
 function writeStatusFile(projDir, runs) {
 	const file = path.join(projDir, ".atomic", "workflows", "status.json");
 	fs.mkdirSync(path.dirname(file), { recursive: true });

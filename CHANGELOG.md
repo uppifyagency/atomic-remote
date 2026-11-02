@@ -30,7 +30,9 @@ field are additive.
   answered. `waitId` names one open question: `stage:<stageId>` for a stage
   question (Atomic publishes it both as the stage's `awaiting_input` and as a
   prompt, reported once), `prompt:<promptId>` for a run-level prompt, so two
-  open prompts in one run (a root and its nested child) stay two waits. `send`, `run-workflow`
+  open prompts in one run (a root and its nested child) stay two waits. Open
+  waits are persisted with the pending runs, so they survive `/reload` and the
+  answer given after it still emits `workflow_input_resolved`. `send`, `run-workflow`
   and `answer` with `--wait` return at once with exit 8 and state
   `awaiting_input`, naming the run and the `answer` command. Before, the wait
   sat silent and ended after the 120 s idle timeout as exit 7 unless the project
