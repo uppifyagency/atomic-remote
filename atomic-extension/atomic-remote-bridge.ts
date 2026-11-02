@@ -26,7 +26,7 @@
  *     injects /workflow reload then /workflow <name> (deterministic entry);
  *     emits workflow_installed {targetPath, overwrote}
  *   - workflow lifecycle is mirrored from Atomic's typed workflow_lifecycle and
- *     workflow_heartbeat hooks (since 0.9.64; transcript notices before that):
+ *     workflow_heartbeat hooks (published since Atomic 0.9.19):
  *     workflow_lifecycle records carry scope/workflowName/status/stage fields;
  *     terminal only for run scope
  *   - status_report busy/idle come from one source of truth (engine isIdle)

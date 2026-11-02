@@ -15,7 +15,7 @@ import {
 	untilOutbox,
 } from "./helpers.mjs";
 
-// 0.4.0 contracts: workflow state comes from Atomic's typed workflow hooks
+// 0.9.64 contracts: workflow state comes from Atomic's typed workflow hooks
 // (workflow_lifecycle / workflow_heartbeat), not from polling session entries.
 
 process.env.ATOMIC_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-0964-test-"));

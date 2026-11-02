@@ -202,7 +202,7 @@ export async function untilOutbox(sessionDir, predicate, { timeoutMs = BRIDGE_SA
 	}
 }
 
-// --- typed workflow hooks (Atomic >= 0.9.63) ----------------------------------
+// --- typed workflow hooks (Atomic >= 0.9.19) ----------------------------------
 // Shaped exactly like the payloads a live Atomic 0.9.64 TUI delivered
 // (fixtures/probe-0964-workflow-events.jsonl): same envelope keys, live
 // delivery, ownerSessionId = the owning TUI session.
