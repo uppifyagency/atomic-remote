@@ -25,14 +25,18 @@ field are additive.
 
 ### Added
 - **Human-input waits end `--wait` promptly with exit 8.** When a stage asks the
-  human, the bridge emits `workflow_awaiting_input {runId, stageId, stageName,
-  owner}`, and `workflow_input_resolved` once answered. `send`, `run-workflow`
+  human, the bridge emits `workflow_awaiting_input {runId, waitId, stageId,
+  stageName, owner}`, and `workflow_input_resolved` with the same `waitId` once
+  answered. `waitId` names one open question: `stage:<stageId>` for a stage
+  question (Atomic publishes it both as the stage's `awaiting_input` and as a
+  prompt, reported once), `prompt:<promptId>` for a run-level prompt, so two
+  open prompts in one run (a root and its nested child) stay two waits. `send`, `run-workflow`
   and `answer` with `--wait` return at once with exit 8 and state
   `awaiting_input`, naming the run and the `answer` command. Before, the wait
   sat silent and ended after the 120 s idle timeout as exit 7 unless the project
   had `statusFile: true` (reproduced live 3/3). With a statusFile the message
   and `outcome` also carry the question and its option labels. `status` lists
-  open waits under `awaitingInput`.
+  open waits, each with its `waitId`, under `awaitingInput`.
 - **`answer` accepts a unique 8-hex run-id prefix**, as Atomic does. The prefix
   resolves against the runs the session's bridge has reported; an ambiguous or
   unknown prefix exits 4 and delivers nothing.

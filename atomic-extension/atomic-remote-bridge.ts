@@ -547,15 +547,20 @@ export default function (pi: ExtensionAPI) {
 		const runId = lifecycle.rootRunId.toLowerCase();
 		const run = knownRuns.get(runId) ?? firstSight(runId, lifecycle.attribution, ctx as SessionCtx);
 		// Atomic keeps the question text out of these hooks; it lives only in statusFile.
-		const setWait = (key: string, open: boolean, stageId: string | null, stageName: string | null) => {
-			if (open === run.waits.has(key)) return;
-			if (open) run.waits.set(key, { stageId, stageName });
-			else run.waits.delete(key);
-			emit({ type: open ? "workflow_awaiting_input" : "workflow_input_resolved", runId, stageId, stageName, owner: run.owner });
+		const setWait = (waitId: string, open: boolean, stageId: string | null, stageName: string | null) => {
+			if (open === run.waits.has(waitId)) return;
+			const wait = run.waits.get(waitId) ?? { stageId, stageName };
+			if (open) run.waits.set(waitId, wait);
+			else run.waits.delete(waitId);
+			emit({ type: open ? "workflow_awaiting_input" : "workflow_input_resolved", runId, waitId, ...wait, owner: run.owner });
 		};
 		if (target.kind === "prompt") {
+			// A stage question publishes both the stage's awaiting_input and this
+			// prompt (recordStagePendingPrompt sets both), so they share one wait id.
+			// A nested child's run-level prompt folds into the root with no stageId.
 			const stageId = target.stageId ?? null;
-			setWait(`prompt:${target.promptId}`, target.status === "opened", stageId, stageId ? (run.stages.get(stageId)?.name ?? null) : null);
+			const waitId = stageId ? `stage:${stageId}` : `prompt:${target.promptId}`;
+			setWait(waitId, target.status === "opened", stageId, stageId ? (run.stages.get(stageId)?.name ?? null) : null);
 			return;
 		}
 		const base = {
@@ -569,7 +574,7 @@ export default function (pi: ExtensionAPI) {
 		if (target.kind === "stage") {
 			run.stages.set(target.stageId, { name: target.stageName, status: target.status });
 			emit({ ...base, kind: target.status, terminal: false, scope: "stage", stageId: target.stageId, stageName: target.stageName, text: null });
-			setWait(target.stageId, target.status === "awaiting_input", target.stageId, target.stageName);
+			setWait(`stage:${target.stageId}`, target.status === "awaiting_input", target.stageId, target.stageName);
 			return;
 		}
 		if (lifecycle.runId.toLowerCase() !== runId) return;
@@ -673,7 +678,7 @@ export default function (pi: ExtensionAPI) {
 							.filter(([, run]) => !run.terminal)
 							.map(([runId]) => runId),
 						awaitingInput: [...knownRuns.entries()].flatMap(([runId, run]) =>
-							[...run.waits.values()].map((wait) => ({ runId, ...wait })),
+							[...run.waits].map(([waitId, wait]) => ({ runId, waitId, ...wait })),
 						),
 						protocol: PROTOCOL,
 						bridgeVersion: BRIDGE_VERSION,

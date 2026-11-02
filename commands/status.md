@@ -15,7 +15,8 @@ If exit code is 3, the session is not live — suggest `/reload` inside Atomic o
 Options:
 - `--commands` also lists the session's slash-command surface (what
   `send --mode command` may dispatch).
-- `awaitingInput` lists runs whose stage is waiting on a human; unblock them
+- `awaitingInput` lists open human-input waits (`runId`, `waitId`, `stageId`,
+  `stageName`), one per open question; unblock them
   with `/atomic-remote:answer`. When the project enables `statusFile: true` in
   its workflow config, the report also gains a `workflowStatus` section with
   the question text.

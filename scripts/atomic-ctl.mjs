@@ -412,7 +412,6 @@ function createOutcomeTracker(payload, flags) {
 		failure: null, // { state, code, message, runId?, failedStageId? }
 	};
 
-	const waitKey = (record) => record.stageId ?? "run";
 	const openWait = (runId) => {
 		const open = st.waits.get(runId);
 		return open && open.size > 0 ? [...open.values()].at(-1) : null;
@@ -485,14 +484,14 @@ function createOutcomeTracker(payload, flags) {
 				break;
 			case "workflow_awaiting_input": {
 				const open = st.waits.get(record.runId) ?? new Map();
-				open.set(waitKey(record), record);
+				open.set(record.waitId, record);
 				st.waits.set(record.runId, open);
 				if (st.myRuns.has(record.runId) && !st.runDetail.get(record.runId)?.terminal)
 					out.push({ op: "awaiting", code: 8, runId: record.runId, wait: record });
 				break;
 			}
 			case "workflow_input_resolved":
-				st.waits.get(record.runId)?.delete(waitKey(record));
+				st.waits.get(record.runId)?.delete(record.waitId);
 				break;
 			case "workflow_lifecycle":
 				if (st.myRuns.has(record.runId)) {

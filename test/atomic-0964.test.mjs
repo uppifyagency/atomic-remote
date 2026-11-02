@@ -282,10 +282,45 @@ test("a run-level prompt opens and closes a wait", async (t) => {
 	await b.hook(b.ev.run(runId, "running"));
 	await b.hook(b.ev.prompt(runId, "p1", "opened"));
 	const report = await b.status("st-wait");
-	assert.deepEqual(report.awaitingInput, [{ runId, stageId: null, stageName: null }]);
+	assert.deepEqual(report.awaitingInput, [{ runId, waitId: "prompt:p1", stageId: null, stageName: null }]);
 	await b.hook(b.ev.prompt(runId, "p1", "answered"));
 	assert.equal(b.records().filter((r) => r.type === "workflow_input_resolved").length, 1);
 	assert.deepEqual((await b.status("st-wait-2")).awaitingInput, []);
+});
+
+test("one stage question (stage awaiting_input plus its prompt) is one wait, opened and resolved once", async (t) => {
+	const b = await boot(t);
+	const runId = "0a0a0a0a-abcd-4ef0-9876-000000000020";
+	await b.hook(b.ev.run(runId, "running"));
+	await b.hook(b.ev.stage(runId, "s1", "ask", "awaiting_input", "running"));
+	await b.hook(b.ev.prompt(runId, "p1", "opened", { stageId: "s1" }));
+	assert.deepEqual((await b.status("st-one")).awaitingInput, [{ runId, waitId: "stage:s1", stageId: "s1", stageName: "ask" }]);
+	await b.hook(b.ev.prompt(runId, "p1", "answered", { stageId: "s1" }));
+	await b.hook(b.ev.stage(runId, "s1", "ask", "running", "awaiting_input"));
+	assert.deepEqual(
+		b.records().filter((r) => r.type === "workflow_awaiting_input" || r.type === "workflow_input_resolved").map((r) => `${r.type}:${r.waitId}`),
+		["workflow_awaiting_input:stage:s1", "workflow_input_resolved:stage:s1"],
+	);
+});
+
+test("run-level prompts of a root and its nested child are separate waits; answering one keeps the other", async (t) => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-wf-"));
+	const b = await boot(t, { cwd });
+	b.drop({ id: "wf-nest", action: "run_workflow", workflowName: "demo-flow", workflowSource: "// x\n" });
+	await b.until((r) => r.type === "accepted" && r.id === "wf-nest");
+	const root = "0a0a0a0a-abcd-4ef0-9876-000000000021";
+	const child = "0b0b0b0b-abcd-4ef0-9876-000000000021";
+	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-nest", data: { runId: root, name: "demo-flow" } });
+	await b.hook(b.ev.run(root, "running"));
+	await b.hook(b.ev.run(child, "running", undefined, { rootRunId: root }));
+	await b.hook(b.ev.prompt(root, "p-root", "opened"));
+	await b.hook(b.ev.prompt(child, "p-child", "opened", { rootRunId: root }));
+	await b.hook(b.ev.prompt(root, "p-root", "answered"));
+	assert.deepEqual((await b.status("st-nest-wait")).awaitingInput, [{ runId: root, waitId: "prompt:p-child", stageId: null, stageName: null }]);
+	const out = await runCtl(["outcome", b.sessionId, "wf-nest"], process.env.ATOMIC_CODING_AGENT_DIR);
+	const outcome = JSON.parse(out.stdout);
+	assert.equal(outcome.state, "awaiting_input", "the child's prompt is still open");
+	assert.equal(outcome.exitCode, 8);
 });
 
 function writeStatusFile(projDir, runs) {
@@ -303,7 +338,7 @@ test("ctl --wait: a tracked run awaiting input returns promptly with exit 8 and 
 	const cmd = await session.nextInboxCommand();
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
 	session.emit({ type: "workflow_started", runId, owner: cmd.id });
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: cmd.id });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: cmd.id });
 	const result = await ctl;
 	assert.equal(result.code, 8, `stderr: ${result.stderr}`);
 	assert.ok(Date.now() - startedAt < 15_000, "must not sit until the idle timeout");
@@ -334,7 +369,7 @@ test("ctl --wait --json: awaiting_input state merges the statusFile question and
 	const cmd = await session.nextInboxCommand();
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
 	session.emit({ type: "workflow_started", runId, owner: cmd.id });
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: cmd.id });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: cmd.id });
 	const result = await ctl;
 	assert.equal(result.code, 8, `stderr: ${result.stderr}`);
 	const outcome = JSON.parse(result.stdout);
@@ -354,7 +389,7 @@ test("ctl --wait: a wait opened before the run was adopted still ends the wait a
 	const cmd = await session.nextInboxCommand();
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
 	session.emit({ type: "turn_bound", id: cmd.id });
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: null });
 	session.emit({
 		type: "agent_settled",
 		owner: cmd.id,
@@ -374,8 +409,8 @@ test("ctl --wait: a resolved wait does not end the wait; completion still does",
 	const ctl = runCtl(["send", session.id, "go", "--wait", "--idle-timeout", "60"], agentDir);
 	const cmd = await session.nextInboxCommand();
 	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
-	session.emit({ type: "workflow_input_resolved", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_input_resolved", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: null });
 	session.emit({ type: "workflow_started", runId, owner: cmd.id });
 	session.emit({ type: "workflow_lifecycle", runId, kind: "completed", terminal: true, owner: cmd.id, scope: "run", text: "done" });
 	const result = await ctl;
@@ -389,7 +424,7 @@ test("outcome: a detached run that is waiting for a human reports awaiting_input
 	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000015";
 	session.emit({ type: "accepted", id: "hil-out", action: "run_workflow", contended: false });
 	session.emit({ type: "workflow_started", runId, owner: "hil-out" });
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: "hil-out" });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: "hil-out" });
 	const result = await runCtl(["outcome", session.id, "hil-out"], agentDir);
 	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
 	const outcome = JSON.parse(result.stdout);
@@ -402,7 +437,7 @@ test("answer: a unique 8-hex prefix resolves to the full run id the bridge knows
 	const agentDir = makeAgentDir();
 	const session = makeSession(agentDir);
 	const runId = "9d9d9d9d-abcd-4ef0-9876-000000000016";
-	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_awaiting_input", runId, waitId: "stage:s1", stageId: "s1", stageName: "ask", owner: null });
 	const result = await runCtl(["answer", session.id, "9D9D9D9D", "yes"], agentDir);
 	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
 	const [cmd] = session.readInboxCommands();

@@ -30,7 +30,8 @@ Two control planes. Pick by situation:
    `statusFile: true` in its workflow config, `status` merges a `workflowStatus`
    section read from `.atomic/workflows/status.json`, the only place the
    question text of an `awaiting_input` run is visible. Open waits are always
-   listed under `awaitingInput` in the status report.
+   listed under `awaitingInput` in the status report, one entry per open
+   question (`runId`, `waitId`, `stageId`, `stageName`).
 
 3. **Send**:
    ```bash
