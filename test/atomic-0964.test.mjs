@@ -404,3 +404,41 @@ test("outcome: a detached run that is waiting for a human reports awaiting_input
 	assert.equal(outcome.exitCode, 8);
 	assert.equal(outcome.runs[0].awaitingInput, true);
 });
+
+// --- answer: unique 8-hex run-id prefix ------------------------------------------
+
+test("answer: a unique 8-hex prefix resolves to the full run id the bridge knows", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	const runId = "9d9d9d9d-abcd-4ef0-9876-000000000016";
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
+	const result = await runCtl(["answer", session.id, "9D9D9D9D", "yes"], agentDir);
+	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+	const [cmd] = session.readInboxCommands();
+	assert.ok(cmd.message.includes(`"runId": "${runId}"`), "the agent must get the full id");
+});
+
+test("answer: a prefix known only from meta.pendingRuns (rotated history) still resolves", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	const runId = "9e9e9e9e-abcd-4ef0-9876-000000000017";
+	session.patchMeta({ pendingRuns: [{ runId, owner: null, workflowName: "x" }] });
+	const result = await runCtl(["answer", session.id, "9e9e9e9e", "yes"], agentDir);
+	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+	assert.ok(session.readInboxCommands()[0].message.includes(runId));
+});
+
+test("answer: an ambiguous or unknown prefix exits 4 and delivers nothing", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	session.emit({ type: "workflow_started", runId: "9f9f9f9f-abcd-4ef0-9876-000000000018", owner: null });
+	session.emit({ type: "workflow_started", runId: "9f9f9f9f-abcd-4ef0-9876-000000000019", owner: null });
+	const ambiguous = await runCtl(["answer", session.id, "9f9f9f9f", "yes"], agentDir);
+	assert.equal(ambiguous.code, 4);
+	assert.match(ambiguous.stderr, /ambiguous/);
+	assert.match(ambiguous.stderr, /000000000018/);
+	const unknown = await runCtl(["answer", session.id, "12345678", "yes"], agentDir);
+	assert.equal(unknown.code, 4);
+	assert.match(unknown.stderr, /no run/i);
+	assert.equal(session.readInboxCommands().length, 0);
+});

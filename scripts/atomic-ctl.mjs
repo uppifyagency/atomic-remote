@@ -217,6 +217,46 @@ function makeOutboxReader(outbox) {
 // which by design never produce a main-chat notice the bridge could mirror.
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RUN_ID_PREFIX_PATTERN = /^[0-9a-f]{8}$/i;
+
+// Every run id the bridge has told us about: in-flight runs persisted in
+// meta.json plus any run named by outbox history (rotated generation too).
+function knownRunIds(target) {
+	const ids = new Set();
+	const add = (value) => {
+		if (typeof value === "string" && RUN_ID_PATTERN.test(value)) ids.add(value.toLowerCase());
+	};
+	try {
+		const meta = JSON.parse(fs.readFileSync(path.join(target.dir, "meta.json"), "utf8"));
+		if (Array.isArray(meta.pendingRuns)) for (const run of meta.pendingRuns) add(run?.runId);
+	} catch {}
+	for (const file of [path.join(target.dir, "outbox.1.jsonl"), path.join(target.dir, "outbox.jsonl")]) {
+		let content;
+		try {
+			content = fs.readFileSync(file, "utf8");
+		} catch {
+			continue;
+		}
+		for (const line of content.split("\n")) {
+			if (!line.includes('"runId"')) continue;
+			try {
+				add(JSON.parse(line).runId);
+			} catch {}
+		}
+	}
+	return ids;
+}
+
+// Atomic accepts a unique 8-hex run-id prefix; so does the controller, resolved
+// against the runs this session's bridge has reported.
+function resolveRunId(target, token) {
+	if (RUN_ID_PATTERN.test(token)) return token.toLowerCase();
+	const prefix = token.toLowerCase();
+	const matches = [...knownRunIds(target)].filter((runId) => runId.startsWith(prefix));
+	if (matches.length === 1) return matches[0];
+	if (matches.length > 1) fail(`Run id prefix "${token}" is ambiguous in session ${target.id}:\n  ${matches.join("\n  ")}`, 4);
+	fail(`No run known to session ${target.id} starts with "${token}". Pass the full run id.`, 4);
+}
 
 function readWorkflowStatus(target) {
 	if (!target.cwd) return null;
@@ -315,7 +355,7 @@ function awaitingMessage(target, runId, wait) {
 		: "\n(question text not visible here: enable `statusFile: true` in the project's workflow config, or read it in the Atomic TUI)";
 	return (
 		`Workflow ${runId} is awaiting human input${wait?.stageName ? ` at stage "${wait.stageName}"` : ""}.${asked}\n` +
-		`Answer with: answer ${String(target.id).slice(0, 8)} ${runId} "<text>"${options ? " (use an option label verbatim)" : ""}`
+		`Answer with: answer ${String(target.id).slice(0, 8)} ${runId.slice(0, 8)} "<text>"${options ? " (use an option label verbatim)" : ""}`
 	);
 }
 
@@ -782,6 +822,7 @@ Commands:
        Install the workflow into the session's .atomic/workflows/, reload,
        and run it deterministically (proto 3)
   answer <target> <run-id> <answer...> [--wait]
+       <run-id> is the full UUID or its unique 8-hex prefix.
        Unblock a workflow run awaiting human input: instructs the agent to
        deliver the answer via the workflow tool (send/delivery:"answer")
   outcome <target> <command-id> [--json]
@@ -934,13 +975,14 @@ async function main() {
 			// Unblocks a workflow run waiting on a human: injects a follow_up that
 			// instructs the agent to deliver the answer through the workflow tool
 			// (the bridge cannot invoke another extension's tool directly).
-			const [token, runId, ...answerParts] = rest;
+			const [token, runToken, ...answerParts] = rest;
 			const answerText = answerParts.join(" ").trim();
-			if (!runId || !answerText) fail('Usage: answer <target|auto> <run-id> <answer...> [--wait]');
-			if (!RUN_ID_PATTERN.test(runId)) {
-				fail(`answer: run id must be a full 36-character UUID, got "${runId}" (${runId.length} chars)`);
+			if (!runToken || !answerText) fail('Usage: answer <target|auto> <run-id> <answer...> [--wait]');
+			if (!RUN_ID_PATTERN.test(runToken) && !RUN_ID_PREFIX_PATTERN.test(runToken)) {
+				fail(`answer: run id must be a full 36-character UUID or its 8-hex prefix, got "${runToken}"`);
 			}
 			const target = resolveTarget(token);
+			const runId = resolveRunId(target, runToken);
 			const message =
 				`A workflow run is waiting for human input: ${runId}.\n` +
 				`Deliver this answer now by calling the workflow tool with ` +

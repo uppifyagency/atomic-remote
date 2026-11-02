@@ -208,12 +208,12 @@ test("item2: answer injects a follow_up instructing the workflow send/answer cal
 	assert.ok(cmd.message.includes("yes, proceed with plan B"));
 });
 
-test("item2: answer rejects a non-UUID run id before touching the inbox", async () => {
+test("item2: answer rejects a malformed run id before touching the inbox", async () => {
 	const agentDir = makeAgentDir();
 	const session = makeSession(agentDir);
-	const result = await runCtl(["answer", session.id, "6f6f6f6f", "text"], agentDir);
+	const result = await runCtl(["answer", session.id, "run-6f6f", "text"], agentDir);
 	assert.equal(result.code, 1);
-	assert.match(result.stderr, /36-character UUID/);
+	assert.match(result.stderr, /36-character UUID or its 8-hex prefix/);
 	assert.equal(session.readInboxCommands().length, 0);
 });
 

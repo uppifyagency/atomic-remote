@@ -112,7 +112,8 @@ Two control planes. Pick by situation:
    ```
    `answer` injects a follow_up instructing the agent to deliver the answer
    through the workflow tool (`send` with `delivery: "answer"`). The run id
-   must be the full 36-character UUID.
+   is the full UUID or its unique 8-hex prefix (exit 4 when the prefix is
+   ambiguous or unknown to the session).
 
 6. **Observe live**: `follow <target>` streams outbox records (one JSON per line;
    bounded, 30 s by default — `--for <s>` to change, `--for 0` to stream forever);
