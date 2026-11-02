@@ -28,8 +28,9 @@ Two control planes. Pick by situation:
    `status <target> --commands` also lists the session's slash-command surface
    (what `--mode command` may dispatch). When the project enables
    `statusFile: true` in its workflow config, `status` merges a `workflowStatus`
-   section read from `.atomic/workflows/status.json` — the only place
-   `awaiting_input` runs are visible.
+   section read from `.atomic/workflows/status.json`, the only place the
+   question text of an `awaiting_input` run is visible. Open waits are always
+   listed under `awaitingInput` in the status report.
 
 3. **Send**:
    ```bash
@@ -76,7 +77,7 @@ Two control planes. Pick by situation:
    ```bash
    node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" outcome <target> <command-id>
    ```
-   JSON answer: `state` is `pending|working|completed|failed|aborted|uncertain|detached`,
+   JSON answer: `state` is `pending|working|completed|failed|aborted|uncertain|detached|awaiting_input`,
    plus reply `text`, `runs` (with `failedStageId`/`stageName` when a workflow
    failed), and `planPath`. After exit 2 or 7 from `send --wait`, poll `outcome`
    instead of resending; on `state: "failed"` with a `failedStageId`, replan
@@ -94,6 +95,7 @@ Two control planes. Pick by situation:
    | 5 | Bridge/run error (incl. failed workflow) | Report the error verbatim |
    | 6 | Attribution uncertain (user typed concurrently) | Report NOTHING as Atomic's reply; inspect with `tail` |
    | 7 | Workflow still running detached (run id printed) | Report the run id and that work continues; check later with `follow`/`tail` — do NOT present intermediate text as the result. If the message names a run awaiting human input, unblock it with `answer` |
+   | 8 | Workflow awaiting human input (run id, stage, question when statusFile is on) | Show the user the question and options; send the user's answer with `answer <target> <runId> "<text>"` (option label verbatim). Do NOT invent an answer, do NOT resend the original command |
 
 5. **Workflows**: if the command makes Atomic launch a workflow, `--wait` follows it to
    its terminal notice (`workflow_lifecycle` records). Never present "Workflow started"
@@ -101,10 +103,10 @@ Two control planes. Pick by situation:
    Long silent runs stay alive through mirrored `workflow_heartbeat` records
    (one per run every ~15 min), which also reset `--idle-timeout`.
 
-5b. **A run waiting on a human is NOT "still working"**: a workflow paused on a
-   question is invisible to the bridge by design (no main-chat notice). When
-   exit 7 or `outcome` reports `awaitingInput: true` for a run (via the
-   project's statusFile), unblock it instead of waiting:
+5b. **A run waiting on a human is NOT "still working"**: when a stage asks the
+   human, `--wait` ends with exit 8 (`state: "awaiting_input"`) and `outcome`
+   reports the same state with `awaitingInput: true` on the run. Unblock it
+   instead of waiting:
    ```bash
    node "${CLAUDE_PLUGIN_ROOT}/scripts/atomic-ctl.mjs" answer <target> <run-id> "the answer"
    ```

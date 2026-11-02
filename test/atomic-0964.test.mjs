@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+	makeAgentDir,
+	makeSession,
+	runCtl,
 	makeFakePi,
 	makeBridgeCtx,
 	makeWorkflowEvents,
@@ -262,4 +265,142 @@ test("reload: a fresh instance keeps in-flight runs and drops runs that ended wh
 	assert.deepEqual((await b.status("st-r2")).pendingWorkflows, [alive]);
 	await world2.fire("workflow_lifecycle", b.ev.run(alive, "completed", "running"), b.ctx);
 	assert.deepEqual((await b.status("st-r3")).pendingWorkflows, []);
+});
+
+// --- human-input waits: workflow_awaiting_input / workflow_input_resolved ------
+
+test("probe replay: each stage question opens a wait and each answer resolves it", async (t) => {
+	const b = await boot(t);
+	const events = probeWorkflowEvents(b.sessionId);
+	const runId = events.find((e) => e.type === "workflow_lifecycle").runId;
+	for (const event of events) await b.hook(event);
+	const waits = b.records().filter((r) => r.type === "workflow_awaiting_input" || r.type === "workflow_input_resolved");
+	assert.deepEqual(
+		waits.map((r) => r.type),
+		["workflow_awaiting_input", "workflow_input_resolved", "workflow_awaiting_input", "workflow_input_resolved"],
+	);
+	assert.ok(waits.every((r) => r.runId === runId && r.stageName === "ask" && r.owner === null));
+	assert.equal(waits[0].stageId, "01723605-255c-40ec-b73c-b11ad06d68f9");
+});
+
+test("a run-level prompt opens and closes a wait", async (t) => {
+	const b = await boot(t);
+	const runId = "0a0a0a0a-abcd-4ef0-9876-000000000010";
+	await b.hook(b.ev.run(runId, "running"));
+	await b.hook(b.ev.prompt(runId, "p1", "opened"));
+	const report = await b.status("st-wait");
+	assert.deepEqual(report.awaitingInput, [{ runId, stageId: null, stageName: null }]);
+	await b.hook(b.ev.prompt(runId, "p1", "answered"));
+	assert.equal(b.records().filter((r) => r.type === "workflow_input_resolved").length, 1);
+	assert.deepEqual((await b.status("st-wait-2")).awaitingInput, []);
+});
+
+function writeStatusFile(projDir, runs) {
+	const file = path.join(projDir, ".atomic", "workflows", "status.json");
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, JSON.stringify({ runs, notices: [], version: 3 }, null, 2));
+}
+
+test("ctl --wait: a tracked run awaiting input returns promptly with exit 8 and the answer command", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir, { cwd: fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-proj-")) });
+	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000011";
+	const startedAt = Date.now();
+	const ctl = runCtl(["send", session.id, "run the release workflow", "--wait", "--idle-timeout", "60"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
+	session.emit({ type: "workflow_started", runId, owner: cmd.id });
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: cmd.id });
+	const result = await ctl;
+	assert.equal(result.code, 8, `stderr: ${result.stderr}`);
+	assert.ok(Date.now() - startedAt < 15_000, "must not sit until the idle timeout");
+	assert.match(result.stderr, /awaiting human input/);
+	assert.match(result.stderr, new RegExp(`answer ${session.id.slice(0, 8)} ${runId.slice(0, 8)}`));
+});
+
+test("ctl --wait --json: awaiting_input state merges the statusFile question and options", async () => {
+	const agentDir = makeAgentDir();
+	const projDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-proj-"));
+	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000012";
+	writeStatusFile(projDir, [
+		{
+			id: runId,
+			name: "release",
+			status: "running",
+			stages: [
+				{
+					name: "ask",
+					status: "awaiting_input",
+					inputRequest: { questions: [{ question: "Ship it?", options: [{ label: "yes" }, { label: "no" }] }] },
+				},
+			],
+		},
+	]);
+	const session = makeSession(agentDir, { cwd: projDir });
+	const ctl = runCtl(["send", session.id, "go", "--wait", "--json"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
+	session.emit({ type: "workflow_started", runId, owner: cmd.id });
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: cmd.id });
+	const result = await ctl;
+	assert.equal(result.code, 8, `stderr: ${result.stderr}`);
+	const outcome = JSON.parse(result.stdout);
+	assert.equal(outcome.state, "awaiting_input");
+	assert.equal(outcome.exitCode, 8);
+	assert.equal(outcome.runId, runId);
+	assert.equal(outcome.stageName, "ask");
+	assert.equal(outcome.runs[0].question.text, "Ship it?");
+	assert.deepEqual(outcome.runs[0].question.options, ["yes", "no"]);
+});
+
+test("ctl --wait: a wait opened before the run was adopted still ends the wait at adoption", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000013";
+	const ctl = runCtl(["send", session.id, "go", "--wait", "--idle-timeout", "60"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
+	session.emit({ type: "turn_bound", id: cmd.id });
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({
+		type: "agent_settled",
+		owner: cmd.id,
+		foreignInputSeen: false,
+		text: "launched",
+		provisional: true,
+		pendingWork: [{ kind: "workflow", runId }],
+	});
+	const result = await ctl;
+	assert.equal(result.code, 8, `stderr: ${result.stderr}`);
+});
+
+test("ctl --wait: a resolved wait does not end the wait; completion still does", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000014";
+	const ctl = runCtl(["send", session.id, "go", "--wait", "--idle-timeout", "60"], agentDir);
+	const cmd = await session.nextInboxCommand();
+	session.emit({ type: "accepted", id: cmd.id, action: "prompt", delivered: "immediate", contended: false });
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_input_resolved", runId, stageId: "s1", stageName: "ask", owner: null });
+	session.emit({ type: "workflow_started", runId, owner: cmd.id });
+	session.emit({ type: "workflow_lifecycle", runId, kind: "completed", terminal: true, owner: cmd.id, scope: "run", text: "done" });
+	const result = await ctl;
+	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+	assert.equal(result.stdout.trim(), "done");
+});
+
+test("outcome: a detached run that is waiting for a human reports awaiting_input / exit 8", async () => {
+	const agentDir = makeAgentDir();
+	const session = makeSession(agentDir);
+	const runId = "8c8c8c8c-abcd-4ef0-9876-000000000015";
+	session.emit({ type: "accepted", id: "hil-out", action: "run_workflow", contended: false });
+	session.emit({ type: "workflow_started", runId, owner: "hil-out" });
+	session.emit({ type: "workflow_awaiting_input", runId, stageId: "s1", stageName: "ask", owner: "hil-out" });
+	const result = await runCtl(["outcome", session.id, "hil-out"], agentDir);
+	assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+	const outcome = JSON.parse(result.stdout);
+	assert.equal(outcome.state, "awaiting_input");
+	assert.equal(outcome.exitCode, 8);
+	assert.equal(outcome.runs[0].awaitingInput, true);
 });

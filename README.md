@@ -116,15 +116,15 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
   workflow into the session's `.atomic/workflows/`, injects `/workflow reload`, then
   `/workflow <name>` — dispatched as real slash commands. Overwriting an existing
   workflow file is reported (`workflow_installed` with `overwrote: true`), never silent.
-- **Typed workflow feedback.** Lifecycle records mirror the workflow engine's own
-  structured notices (`customType "workflows:lifecycle-notice"`): run and stage scope,
-  workflow name, status, failed stage, error. The v2 keyword regex over serialized
-  entries is gone, and with it both its false negatives (exit-7 timeouts) and its
-  false positives (assistant text quoting a run id near "completed"). Stage events
-  are mirrored but only run-scope terminal kinds end a `--wait`.
+- **Typed workflow feedback.** Lifecycle records come from Atomic's typed
+  `workflow_lifecycle` hooks, filtered to the session that owns the run: run and
+  stage scope, every stage transition, workflow name, failed stage and error. The
+  bridge no longer polls the transcript for chat notices, so a project that turns
+  workflow notices off still reports correctly. Stage events are mirrored, but only
+  run-scope terminal statuses end a `--wait`.
 - **Queryable outcomes.** `outcome <target> <command-id>` replays outbox history —
   closed sessions included — through the same state machine `--wait` runs live, and
-  answers with JSON: `state` (`pending|working|completed|failed|aborted|uncertain|detached`),
+  answers with JSON: `state` (`pending|working|completed|failed|aborted|uncertain|detached|awaiting_input`),
   reply text, runs, failed stage. A wait that timed out (exit 2/7) can always be
   resolved later without re-sending. `send --wait --json` prints the same object.
 - **One source of truth for busy/idle.** `status` derives both fields from the
@@ -137,11 +137,14 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 - **Workflow-aware waits.** If your command launches an Atomic workflow, `--wait`
   follows the run to its terminal lifecycle notice instead of printing
   "Workflow started" as if it were the result.
-- **Human-in-the-loop visibility.** When the project enables `statusFile: true`
-  in its workflow config, `status` merges a `workflowStatus` section from
-  `.atomic/workflows/status.json`, waits and `outcome` flag runs with
-  `awaitingInput: true`, and `answer <target> <run-id> "..."` unblocks a run
-  paused on a human question — the one state that is invisible on the main chat.
+- **Human-in-the-loop waits end promptly.** When a stage of a run you are waiting
+  on asks the human a question, the bridge emits `workflow_awaiting_input` and
+  `--wait` returns at once with exit 8 and state `awaiting_input`, naming the run
+  and the `answer <target> <run-id> "..."` command that unblocks it. Atomic keeps
+  the question text out of its hooks: when the project enables `statusFile: true`,
+  the exit-8 message and `outcome` also show the question and its option labels,
+  and `status` merges a `workflowStatus` section from `.atomic/workflows/status.json`.
+  `status` always lists open waits under `awaitingInput`.
 - **Long runs stay observable.** The workflow engine's periodic heartbeat cards
   are mirrored as `workflow_heartbeat` records (one per run, ~15 min), which
   also reset `--wait`'s idle timeout; unclaimed attribution state expires as
@@ -170,6 +173,7 @@ node scripts/rpc-run.mjs [--atomic <bin>] "one-shot headless prompt"
 | 5 | Bridge or run error (including failed workflows) |
 | 6 | Attribution uncertain — concurrent user input; inspect with `tail` |
 | 7 | Detached async work still running (workflow run id printed) |
+| 8 | Workflow awaiting human input; answer with `answer <target> <runId> <text>` |
 
 ## Security
 

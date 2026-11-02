@@ -147,6 +147,8 @@ interface RunState {
 	terminal: boolean;
 	workflowName: string | null;
 	stages: Map<string, { name: string; status: string }>;
+	// Open human-input waits, keyed by stage id or "prompt:<promptId>".
+	waits: Map<string, { stageId: string | null; stageName: string | null }>;
 }
 
 interface RejectedCommand {
@@ -521,7 +523,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const firstSight = (runId: string, attribution: string | undefined, ctx: SessionCtx): RunState => {
-		const run: RunState = { owner: null, terminal: false, workflowName: runEntries(ctx, runId).name ?? null, stages: new Map() };
+		const run: RunState = { owner: null, terminal: false, workflowName: runEntries(ctx, runId).name ?? null, stages: new Map(), waits: new Map() };
 		const launch = pendingWorkflowLaunch;
 		// Agent launches belong to the workflow tool's result (tool_execution_end);
 		// scheduler and recovery starts were launched by nobody remote.
@@ -552,10 +554,23 @@ export default function (pi: ExtensionAPI) {
 		seenEventIds.add(lifecycle.eventId);
 		if (seenEventIds.size > SEEN_EVENT_CAP) seenEventIds.delete(seenEventIds.values().next().value as string);
 		const target = lifecycle.target;
-		if (target.kind === "tool" || target.kind === "prompt") return;
+		if (target.kind === "tool") return;
 		sweepPendingState();
 		const runId = lifecycle.rootRunId.toLowerCase();
 		const run = knownRuns.get(runId) ?? firstSight(runId, lifecycle.attribution, ctx as SessionCtx);
+		// No question text travels with these: Atomic keeps it out of the hooks
+		// (and out of the transcript); the controller reads it from statusFile.
+		const setWait = (key: string, open: boolean, stageId: string | null, stageName: string | null) => {
+			if (open === run.waits.has(key)) return;
+			if (open) run.waits.set(key, { stageId, stageName });
+			else run.waits.delete(key);
+			emit({ type: open ? "workflow_awaiting_input" : "workflow_input_resolved", runId, stageId, stageName, owner: run.owner });
+		};
+		if (target.kind === "prompt") {
+			const stageId = target.stageId ?? null;
+			setWait(`prompt:${target.promptId}`, target.status === "opened", stageId, stageId ? (run.stages.get(stageId)?.name ?? null) : null);
+			return;
+		}
 		const base = {
 			type: "workflow_lifecycle",
 			runId,
@@ -567,6 +582,7 @@ export default function (pi: ExtensionAPI) {
 		if (target.kind === "stage") {
 			run.stages.set(target.stageId, { name: target.stageName, status: target.status });
 			emit({ ...base, kind: target.status, terminal: false, scope: "stage", stageId: target.stageId, stageName: target.stageName, text: null });
+			setWait(target.stageId, target.status === "awaiting_input", target.stageId, target.stageName);
 			return;
 		}
 		// A nested run's own status is internal to its root: only its stages surface.
@@ -574,8 +590,10 @@ export default function (pi: ExtensionAPI) {
 		const kind = runKind(target);
 		const terminal = WORKFLOW_TERMINAL_STATUSES.includes(target.status) || target.action === "quit";
 		const wasTerminal = run.terminal;
-		if (terminal) run.terminal = true;
-		else if (target.status === "running" && target.action === undefined) run.terminal = false;
+		if (terminal) {
+			run.terminal = true;
+			run.waits.clear();
+		} else if (target.status === "running" && target.action === undefined) run.terminal = false;
 		const failedStage =
 			target.status === "failed" ? [...run.stages].reverse().find(([, stage]) => stage.status === "failed") : undefined;
 		const error = target.status === "failed" || target.status === "blocked" ? runEntries(ctx as SessionCtx, runId).error : undefined;
@@ -671,6 +689,9 @@ export default function (pi: ExtensionAPI) {
 						pendingWorkflows: [...knownRuns.entries()]
 							.filter(([, run]) => !run.terminal)
 							.map(([runId]) => runId),
+						awaitingInput: [...knownRuns.entries()].flatMap(([runId, run]) =>
+							[...run.waits.values()].map((wait) => ({ runId, ...wait })),
+						),
 						protocol: PROTOCOL,
 						bridgeVersion: BRIDGE_VERSION,
 						...(cmd.include?.includes("commands") ? { commands: knownCommandNames(pi) ?? [] } : {}),
@@ -985,6 +1006,7 @@ export default function (pi: ExtensionAPI) {
 					terminal: false,
 					workflowName: typeof workflowName === "string" ? workflowName : null,
 					stages: new Map(),
+					waits: new Map(),
 				});
 			}
 			persistPendingRuns();
@@ -1216,7 +1238,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		knownRuns.set(runId, { owner: activeOwner, terminal: false, workflowName: null, stages: new Map() });
+		knownRuns.set(runId, { owner: activeOwner, terminal: false, workflowName: null, stages: new Map(), waits: new Map() });
 		persistPendingRuns();
 		emit({ type: "workflow_started", runId, owner: activeOwner });
 	});

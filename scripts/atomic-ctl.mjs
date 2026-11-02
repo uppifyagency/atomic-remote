@@ -13,6 +13,7 @@
  *   4 target not found or ambiguous        5 bridge or run error
  *   6 attribution uncertain (concurrent user input)
  *   7 detached async work still running (workflow run id printed)
+ *   8 workflow awaiting human input (answer with: answer <target> <runId> <text>)
  *   1 usage error
  */
 
@@ -304,6 +305,20 @@ function awaitingHint(target, runIds) {
 	return `\nRun(s) awaiting human input: ${ids}${questions}\nUnblock with: answer ${String(target.id).slice(0, 8)} <runId> "<answer>" (use an option label verbatim)`;
 }
 
+// Atomic keeps the question text out of its workflow hooks: statusFile is
+// the only zero-token place to read it from.
+function awaitingMessage(target, runId, wait) {
+	const question = awaitingInputRuns(target, [runId])[0]?.question;
+	const options = question?.options?.length ? ` [${question.options.map((o) => JSON.stringify(o)).join(" | ")}]` : "";
+	const asked = question?.text
+		? `\nQuestion: ${question.text}${options}`
+		: "\n(question text not visible here: enable `statusFile: true` in the project's workflow config, or read it in the Atomic TUI)";
+	return (
+		`Workflow ${runId} is awaiting human input${wait?.stageName ? ` at stage "${wait.stageName}"` : ""}.${asked}\n` +
+		`Answer with: answer ${String(target.id).slice(0, 8)} ${runId} "<text>"${options ? " (use an option label verbatim)" : ""}`
+	);
+}
+
 // --- command transport (roadmap #1: refuse delivery to the dead) ------------
 
 let commandSeq = 0;
@@ -358,12 +373,26 @@ function createOutcomeTracker(payload, flags) {
 		workflowName: null,
 		myRuns: new Set(),
 		runDetail: new Map(), // runId -> last workflow_lifecycle record
+		// runId -> open waits (key -> awaiting record), for every run: a wait can
+		// open before a provisional settle adopts its run.
+		waits: new Map(),
 		resolved: null, // { text }
 		failure: null, // { state, code, message, runId?, failedStageId? }
 	};
 
-	// Directives for a live loop: {op:"note"|"resolve"|"fail", ...}. A post-hoc
-	// replay ignores them and reads snapshot() instead.
+	const waitKey = (record) => record.stageId ?? "run";
+	const openWait = (runId) => {
+		const open = st.waits.get(runId);
+		return open && open.size > 0 ? [...open.values()].at(-1) : null;
+	};
+	const adopt = (runId, out) => {
+		st.myRuns.add(runId);
+		const wait = openWait(runId);
+		if (wait) out.push({ op: "awaiting", code: 8, runId, wait });
+	};
+
+	// Directives for a live loop: {op:"note"|"resolve"|"fail"|"awaiting", ...}.
+	// A post-hoc replay ignores them and reads snapshot() instead.
 	function apply(record) {
 		const out = [];
 		switch (record.type) {
@@ -420,13 +449,25 @@ function createOutcomeTracker(payload, flags) {
 				break;
 			case "workflow_started":
 				if (record.owner === payload.id) {
-					st.myRuns.add(record.runId);
 					out.push({ op: "note", message: `note: workflow launched (${record.runId}) — waiting for its terminal notice` });
+					adopt(record.runId, out);
 				}
+				break;
+			case "workflow_awaiting_input": {
+				const open = st.waits.get(record.runId) ?? new Map();
+				open.set(waitKey(record), record);
+				st.waits.set(record.runId, open);
+				if (st.myRuns.has(record.runId) && !st.runDetail.get(record.runId)?.terminal)
+					out.push({ op: "awaiting", code: 8, runId: record.runId, wait: record });
+				break;
+			}
+			case "workflow_input_resolved":
+				st.waits.get(record.runId)?.delete(waitKey(record));
 				break;
 			case "workflow_lifecycle":
 				if (st.myRuns.has(record.runId)) {
 					st.runDetail.set(record.runId, record);
+					if (record.terminal) st.waits.delete(record.runId);
 					if (record.terminal) {
 						if (record.kind === "completed") {
 							st.resolved = { text: record.text ?? `workflow ${record.runId} completed` };
@@ -470,8 +511,8 @@ function createOutcomeTracker(payload, flags) {
 				}
 				if (record.provisional && st.myRuns.size > 0) break; // workflow still running
 				if (record.provisional && Array.isArray(record.pendingWork)) {
-					for (const work of record.pendingWork) if (work.runId) st.myRuns.add(work.runId);
 					out.push({ op: "note", message: "note: turn settled with detached async work — waiting for workflow completion" });
+					for (const work of record.pendingWork) if (work.runId) adopt(work.runId, out);
 					break;
 				}
 				if (owned && record.foreignInputSeen)
@@ -502,6 +543,7 @@ function createOutcomeTracker(payload, flags) {
 					terminal: detail?.terminal ?? false,
 					...(detail?.failedStageId ? { failedStageId: detail.failedStageId } : {}),
 					...(detail?.stageName ? { stageName: detail.stageName } : {}),
+					...(openWait(runId) ? { awaitingInput: true } : {}),
 				};
 			}),
 		};
@@ -518,6 +560,18 @@ function createOutcomeTracker(payload, flags) {
 		}
 		if (st.resolved) return { ...base, state: "completed", exitCode: 0, text: st.resolved.text };
 		if (!st.accepted) return { ...base, state: "pending", exitCode: 2 };
+		const waitingRun = pendingRuns.find((runId) => openWait(runId));
+		if (waitingRun) {
+			const wait = openWait(waitingRun);
+			return {
+				...base,
+				state: "awaiting_input",
+				exitCode: 8,
+				runId: waitingRun,
+				...(wait.stageId ? { stageId: wait.stageId } : {}),
+				...(wait.stageName ? { stageName: wait.stageName } : {}),
+			};
+		}
 		if (pendingRuns.length > 0) return { ...base, state: "detached", exitCode: 7, runId: pendingRuns[0] };
 		return { ...base, state: "working", exitCode: 2 };
 	}
@@ -595,6 +649,9 @@ async function waitForOutcome(target, payload, flags) {
 					if (flags.json) return finish(0);
 					console.log(directive.text);
 					return 0;
+				} else if (directive.op === "awaiting") {
+					console.error(awaitingMessage(target, directive.runId, directive.wait));
+					return flags.json ? finish(directive.code) : directive.code;
 				} else if (directive.op === "fail") {
 					if (flags.json) {
 						console.error(directive.message.replace("tail <target>", `tail ${target.id.slice(0, 8)}`));
@@ -730,7 +787,7 @@ Commands:
   outcome <target> <command-id> [--json]
        Query a past command's result from outbox history (safe to poll;
        works on closed sessions): state pending|working|completed|failed|
-       aborted|uncertain|detached, text, runs, failedStageId
+       aborted|uncertain|detached|awaiting_input, text, runs, failedStageId
   tail <target> [--lines <n>]  Print recent outbox records (works on closed sessions)
   follow <target> [--for <s>]  Stream outbox records (default 30s; --for 0 = forever)
   abort <target>               Abort the session's current turn
@@ -738,7 +795,8 @@ Commands:
 
 Exit codes: 0 ok · 1 usage · 2 timeout · 3 no session recorded/delivery refused
             4 target not found or ambiguous · 5 bridge/run error
-            6 attribution uncertain · 7 async work detached`;
+            6 attribution uncertain · 7 async work detached
+            8 workflow awaiting human input (answer <target> <runId> <text>)`;
 
 async function main() {
 	const [command, ...argv] = process.argv.slice(2);
