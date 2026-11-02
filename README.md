@@ -5,7 +5,7 @@
 <br><br>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.1-38bdf8?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.2-38bdf8?style=flat-square)](CHANGELOG.md)
 [![Protocol](https://img.shields.io/badge/protocol-v3-e8edf6?style=flat-square&labelColor=0b0e14)](#what-protocol-v3-guarantees)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-4ade80?style=flat-square)](#)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
@@ -58,7 +58,7 @@ claude plugin install atomic-remote@atomic-remote
 
 **2. Atomic side** — from any Claude Code session run `/atomic-remote:setup`
 (or manually: `node scripts/install-bridge.mjs`). Then, **inside the running Atomic
-session**, run `/reload`. You'll see: `atomic-remote bridge v0.3.1 active (…)`.
+session**, run `/reload`. You'll see: `atomic-remote bridge v0.3.2 active (…)`.
 
 Sessions are named automatically after their working directory; override with
 `/remote-name <name>` inside Atomic or `/name` (tracked automatically).

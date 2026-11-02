@@ -18,6 +18,12 @@ const { default: registerBridge } = await import("../atomic-extension/atomic-rem
 
 let bootSeq = 0;
 
+function readRotated(dir) {
+	const file = path.join(dir, "outbox.1.jsonl");
+	if (!fs.existsSync(file)) return [];
+	return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
 async function boot(t, { cwd } = {}) {
 	const sessionId = `ttl-${String(bootSeq++).padStart(3, "0")}-${Math.random().toString(36).slice(2, 8)}`;
 	const world = makeFakePi();
@@ -42,7 +48,10 @@ async function boot(t, { cwd } = {}) {
 			fs.writeFileSync(path.join(inboxDir, ".tmp", file), JSON.stringify(payload));
 			fs.renameSync(path.join(inboxDir, ".tmp", file), path.join(inboxDir, file));
 		},
-		records: () => readOutbox(dir),
+		// OUTBOX_MAX_BYTES is tiny here and bridge_ready carries process.cwd(),
+		// so a long checkout path rotates the outbox mid-test: read both
+		// generations, as the controller does.
+		records: () => [...readRotated(dir), ...readOutbox(dir)],
 		until: (predicate, options) => untilOutbox(dir, predicate, options),
 	};
 }

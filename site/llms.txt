@@ -3,7 +3,7 @@
 > A Claude Code plugin that turns any Atomic (by Bastani) terminal session into a
 > remotely-commandable agent. Claude Code plans; Atomic executes; replies come back
 > attributed and typed. Zero runtime dependencies, strictly local file transport,
-> official Atomic APIs only. Current version: 0.3.1 (bridge protocol v3).
+> official Atomic APIs only. Current version: 0.3.2 (bridge protocol v3).
 
 ## What it does
 

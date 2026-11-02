@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.2] - 2026-11-02
+
+Atomic 0.9.63 compatibility, from a live end-to-end run against a 0.9.63 TUI
+session. Protocol stays 3; the only new record field (`synthesized` on
+`agent_settled`) is additive.
+
+### Fixed
+- **Interrupt waits no longer hang.** 0.9.63 runs an interrupt's turn through
+  the raw agent loop, which emits `agent_end` but never `agent_settled`
+  (`agent-session-message-queue.ts`, `sendInterruptCustomMessageUnlocked`).
+  `send --mode interrupt --wait` timed out with exit 2, and the stale owner
+  then captured the next unrelated turn (live: a workflow notice reply was
+  attributed to the interrupt). The bridge now settles an interrupt-owned turn
+  itself once the engine reports idle past a short grace, marked
+  `synthesized: "interrupt_turn"`; a real settle cancels the fallback.
+- **Workflow stages are no longer remote targets.** 0.9.63 runs stages and
+  subagents as in-process child sessions that load the global bridge, so each
+  stage registered under the parent's cwd name and `send <name>` turned
+  ambiguous (exit 4) for the whole run. Sessions with an `orchestrationContext`
+  or `subagentPolicy` now skip registration.
+- **Awaiting-input runs are detected.** 0.9.63 keeps a waiting run at
+  `status: "running"` and marks the stage (`awaiting_input`, `inputRequest`),
+  so `awaitingInput` was never set. The controller now uses the engine's own
+  predicate and also surfaces the pending question and its option labels
+  (answers must match a label verbatim; a stage that got its answer then asks
+  a readiness gate).
+- The TTL suite no longer fails when the checkout path is long: the tiny test
+  outbox rotated mid-test and the assertions read only the fresh generation.
+
 ## [0.3.1] - 2026-08-26
 
 Attribution hardening, human-in-the-loop visibility, and honest replay
