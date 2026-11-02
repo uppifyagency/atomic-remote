@@ -11,10 +11,23 @@ function runRpc(args, scenario) {
 	});
 }
 
-test("rpc-run: streams the assistant text and exits 0 on agent_end", async () => {
+test("rpc-run: streams the assistant text and exits 0 on agent_settled", async () => {
 	const result = await runRpc(["say hello"], "reply");
 	assert.equal(result.code, 0);
 	assert.equal(result.stdout, "hello world\n");
+});
+
+test("rpc-run: keeps streaming past an agent_end until agent_settled", async () => {
+	const result = await runRpc(["--timeout", "5", "flaky"], "retry");
+	assert.equal(result.code, 0);
+	assert.equal(result.stdout, "first try after retry\n");
+});
+
+test("rpc-run: a prompt handled by an extension exits 0 without waiting for a run", async () => {
+	const started = Date.now();
+	const result = await runRpc(["--timeout", "5", "/ext-command"], "handled");
+	assert.equal(result.code, 0);
+	assert.ok(Date.now() - started < 3000, "returned before the timeout");
 });
 
 test("rpc-run: a rejected prompt exits 1 immediately with the RPC error", async () => {

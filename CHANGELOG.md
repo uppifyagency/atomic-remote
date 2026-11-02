@@ -51,6 +51,12 @@ field are additive.
   as pending forever: Atomic does not re-deliver lifecycle hooks to the new
   extension instance, so the bridge retires persisted runs that already have a
   `workflow.run.end` entry.
+- **`rpc-run` exits on `agent_settled`, not the first `agent_end`.** Atomic's
+  `agent_end` closes one low-level run, and a retry or compaction recovery can
+  follow it (docs `json.md`), so `rpc-run` could cut the answer short. It now
+  streams until `agent_settled`. A prompt whose response has
+  `disposition: "handled"` (an extension command or input handler consumed it,
+  so no run starts) exits 0 at once instead of waiting for the timeout.
 
 ## [0.3.2] - 2026-11-02
 

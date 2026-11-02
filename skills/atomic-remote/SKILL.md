@@ -138,7 +138,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/rpc-run.mjs" --atomic "$HOME/.nvm/versions/n
 ```
 
 Spawns a NEW `atomic --mode rpc --no-session` in the current cwd; streams text; exits on
-`agent_end`. It does not touch the user's open terminal session.
+`agent_settled`, or at once when an extension handled the prompt. It does not touch the user's open terminal session.
 
 ## Security
 
