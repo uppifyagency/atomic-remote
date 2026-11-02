@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * atomic-ctl v0.3.1 — Claude Code-side controller for the atomic-remote bridge.
+ * atomic-ctl v0.3.2 — Claude Code-side controller for the atomic-remote bridge.
  *
  * Usage: run with --help. The USAGE constant below is the single authoritative
  * command reference; this header deliberately does not duplicate it.
@@ -227,34 +227,69 @@ function readWorkflowStatus(target) {
 		return null;
 	}
 	const runs = Array.isArray(snapshot?.runs)
-		? snapshot.runs.map((run) => ({
-				runId: String(run?.id ?? "").toLowerCase(),
-				name: typeof run?.name === "string" ? run.name : null,
-				status: typeof run?.status === "string" ? run.status : null,
-			}))
+		? snapshot.runs.map((run) => {
+				const question = pendingQuestion(run);
+				return {
+					runId: String(run?.id ?? "").toLowerCase(),
+					name: typeof run?.name === "string" ? run.name : null,
+					status: typeof run?.status === "string" ? run.status : null,
+					...(question ? { awaitingInput: true, question } : {}),
+				};
+			})
 		: [];
 	return { path: file, runs };
+}
+
+// Atomic 0.9.63 never puts "awaiting_input" on a run (RunStatus is
+// pending|running|paused|exit|killed, workflows shared/store-types.ts:17): the
+// run stays "running" and the wait lives on a stage or on run.pendingPrompt.
+// Same predicate as the engine's runHasPendingInput
+// (workflows shared/run-indicator-status.ts:67). Answers must match an option
+// label exactly, and a stage that got its answer then asks a readiness gate,
+// so the question and its labels are surfaced with the flag.
+function pendingQuestion(run) {
+	const stages = Array.isArray(run?.stages) ? run.stages : [];
+	const waiting = stages.find(
+		(stage) =>
+			stage?.status === "awaiting_input" ||
+			stage?.awaitingInputSince !== undefined ||
+			stage?.pendingPrompt !== undefined ||
+			stage?.inputRequest !== undefined,
+	);
+	if (!waiting && run?.pendingPrompt === undefined && run?.status !== "awaiting_input") return null;
+	const request = waiting?.inputRequest ?? waiting?.pendingPrompt ?? run?.pendingPrompt;
+	const first = Array.isArray(request?.questions) ? request.questions[0] : request;
+	return {
+		stage: typeof waiting?.name === "string" ? waiting.name : null,
+		text: typeof first?.question === "string" ? first.question : null,
+		options: Array.isArray(first?.options)
+			? first.options.map((option) => (typeof option === "string" ? option : option?.label)).filter((label) => typeof label === "string")
+			: [],
+	};
 }
 
 function awaitingInputRuns(target, runIds) {
 	const status = readWorkflowStatus(target);
 	if (!status) return [];
 	const wanted = new Set([...runIds].map((id) => String(id).toLowerCase()));
-	return status.runs.filter((run) => wanted.has(run.runId) && run.status === "awaiting_input");
+	return status.runs.filter((run) => wanted.has(run.runId) && run.awaitingInput === true);
 }
 
 function annotateAwaiting(target, snapshot) {
 	if (!Array.isArray(snapshot.runs) || snapshot.runs.length === 0) return snapshot;
-	const awaiting = new Set(
+	const awaiting = new Map(
 		awaitingInputRuns(
 			target,
 			snapshot.runs.map((run) => run.runId),
-		).map((run) => run.runId),
+		).map((run) => [run.runId, run.question]),
 	);
 	if (awaiting.size === 0) return snapshot;
 	return {
 		...snapshot,
-		runs: snapshot.runs.map((run) => (awaiting.has(String(run.runId).toLowerCase()) ? { ...run, awaitingInput: true } : run)),
+		runs: snapshot.runs.map((run) => {
+			const key = String(run.runId).toLowerCase();
+			return awaiting.has(key) ? { ...run, awaitingInput: true, question: awaiting.get(key) } : run;
+		}),
 	};
 }
 
@@ -262,7 +297,11 @@ function awaitingHint(target, runIds) {
 	const awaiting = awaitingInputRuns(target, runIds);
 	if (awaiting.length === 0) return "";
 	const ids = awaiting.map((run) => run.runId).join(", ");
-	return `\nRun(s) awaiting human input: ${ids}\nUnblock with: answer ${String(target.id).slice(0, 8)} <runId> "<answer>"`;
+	const questions = awaiting
+		.filter((run) => run.question?.text)
+		.map((run) => `\n  ${run.runId}: ${run.question.text}${run.question.options.length ? ` [${run.question.options.map((o) => JSON.stringify(o)).join(" | ")}]` : ""}`)
+		.join("");
+	return `\nRun(s) awaiting human input: ${ids}${questions}\nUnblock with: answer ${String(target.id).slice(0, 8)} <runId> "<answer>" (use an option label verbatim)`;
 }
 
 // --- command transport (roadmap #1: refuse delivery to the dead) ------------
@@ -669,7 +708,7 @@ function newCommandId() {
 
 // --- main ---------------------------------------------------------------------
 
-const USAGE = `atomic-ctl v0.3.1 — command running Atomic sessions via the atomic-remote bridge
+const USAGE = `atomic-ctl v0.3.2 — command running Atomic sessions via the atomic-remote bridge
 
 Commands:
   list [--json] [--all]        Show sessions (live/stale; --all includes closed)

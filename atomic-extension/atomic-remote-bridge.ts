@@ -1,5 +1,5 @@
 /**
- * atomic-remote bridge v0.3.1 — Atomic-side half of the atomic-remote Claude Code plugin.
+ * atomic-remote bridge v0.3.2 — Atomic-side half of the atomic-remote Claude Code plugin.
  *
  * Install into ~/.atomic/agent/extensions/ (the plugin's /atomic-remote:setup command
  * does this), then run /reload inside the Atomic session.
@@ -56,7 +56,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@bastani/atomic";
 
-const BRIDGE_VERSION = "0.3.1";
+const BRIDGE_VERSION = "0.3.2";
 const PROTOCOL = 3;
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -88,6 +88,12 @@ const BINDING_TTL_MS = envMs("ATOMIC_REMOTE_BINDING_TTL_MS", 600_000);
 const BINDING_CAP = 32;
 const LAUNCH_TTL_MS = envMs("ATOMIC_REMOTE_LAUNCH_TTL_MS", 60_000);
 const OUTBOX_MAX_BYTES = envMs("ATOMIC_REMOTE_OUTBOX_MAX_BYTES", 8 * 1024 * 1024);
+// Atomic 0.9.63 runs an interrupt's turn through the raw agent loop
+// (agent-session-message-queue.ts, sendInterruptCustomMessageUnlocked ->
+// session.agent.prompt), which never reaches settleAgentRun: the turn emits
+// agent_start/agent_end but no agent_settled. Once the engine is idle past
+// this grace, the bridge settles that turn itself.
+const INTERRUPT_SETTLE_GRACE_MS = envMs("ATOMIC_REMOTE_INTERRUPT_SETTLE_GRACE_MS", 1_500);
 const WORKFLOW_SCAN_MS = 5_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
@@ -323,6 +329,12 @@ export default function (pi: ExtensionAPI) {
 	let endSeenSinceStart = false;
 	let foreignSinceLastSettle = false;
 	let lastTextForOwner: string | null = null;
+	let interruptTurnOwner: string | null = null; // owner of a turn an interrupt started
+	let interruptSettleTimer: ReturnType<typeof setTimeout> | undefined;
+	const cancelInterruptSettle = () => {
+		if (interruptSettleTimer) clearTimeout(interruptSettleTimer);
+		interruptSettleTimer = undefined;
+	};
 
 	// Workflow tracking (roadmap #3).
 	const knownRuns = new Map<string, { owner: string | null; terminal: boolean }>();
@@ -438,6 +450,7 @@ export default function (pi: ExtensionAPI) {
 		if (heartbeatTimer) clearInterval(heartbeatTimer);
 		if (safetyTimer) clearInterval(safetyTimer);
 		if (workflowTimer) clearInterval(workflowTimer);
+		cancelInterruptSettle();
 		heartbeatTimer = undefined;
 		safetyTimer = undefined;
 		workflowTimer = undefined;
@@ -887,6 +900,7 @@ export default function (pi: ExtensionAPI) {
 		interruptPending = null;
 		activeOwner = null;
 		preemptedOwner = null;
+		interruptTurnOwner = null;
 		endSeenSinceStart = false;
 		foreignSinceLastSettle = false;
 		lastTextForOwner = null;
@@ -894,6 +908,21 @@ export default function (pi: ExtensionAPI) {
 		entryCursor = 0;
 		agentRunning = false;
 		outboxApproxBytes = -1;
+
+		// Atomic 0.9.63 runs workflow stages and subagents as in-process child
+		// sessions that load the same global extensions (context-types.ts:
+		// orchestrationContext.kind "workflow-stage", subagentPolicy). Registering
+		// them made every stage a remote target named after the parent's cwd, so
+		// `send <name>` turned ambiguous for the whole run. Children are driven by
+		// their workflow, not remotely: they get no session dir at all.
+		const child = ctx as { orchestrationContext?: unknown; subagentPolicy?: unknown };
+		if (child.orchestrationContext != null || child.subagentPolicy != null) {
+			sessionDir = undefined;
+			inboxDir = undefined;
+			outboxPath = undefined;
+			engineCtx = undefined;
+			return;
+		}
 
 		let sessionId: string | null = null;
 		try {
@@ -1019,6 +1048,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		sweepPendingState();
+		cancelInterruptSettle();
 		agentRunning = true;
 		endSeenSinceStart = false;
 		if (interruptPending !== null) {
@@ -1027,6 +1057,7 @@ export default function (pi: ExtensionAPI) {
 			// The preempted owner is kept: its aborted run may still settle late.
 			if (activeOwner !== null) preemptedOwner = activeOwner;
 			activeOwner = interruptPending;
+			interruptTurnOwner = activeOwner;
 			interruptPending = null;
 			emit({ type: "turn_bound", id: activeOwner, via: "interrupt" });
 		}
@@ -1035,13 +1066,64 @@ export default function (pi: ExtensionAPI) {
 		emit({ type: "agent_start", owner: activeOwner });
 	});
 
-	pi.on("agent_end", async (event) => {
+	// Polls until the engine is idle; any agent_start or real agent_settled
+	// cancels it first, so engines that do settle the interrupt turn win.
+	const armInterruptSettle = (ctx: unknown) => {
+		cancelInterruptSettle();
+		interruptSettleTimer = setTimeout(() => {
+			interruptSettleTimer = undefined;
+			let idle = false;
+			try {
+				const engine = ctx as { isIdle?: () => boolean };
+				idle = engine?.isIdle ? engine.isIdle() : !agentRunning;
+			} catch {
+				idle = false;
+			}
+			if (!idle) {
+				armInterruptSettle(ctx);
+				return;
+			}
+			settleActive(ctx, { synthesized: "interrupt_turn" });
+		}, INTERRUPT_SETTLE_GRACE_MS);
+		interruptSettleTimer.unref?.();
+	};
+
+	pi.on("agent_end", async (event, ctx) => {
 		endSeenSinceStart = true;
 		const messages = ((event as { messages?: MessageLike[] }).messages ?? []) as MessageLike[];
 		const text = extractAssistantText(messages);
 		if (text !== null) lastTextForOwner = text;
 		emit({ type: "agent_end", owner: activeOwner, text });
+		if (activeOwner !== null && activeOwner === interruptTurnOwner) armInterruptSettle(ctx);
 	});
+
+	const settleActive = (ctx: unknown, extra: Record<string, unknown> = {}) => {
+		cancelInterruptSettle();
+		agentRunning = false;
+		writeHeartbeat();
+		scanEntriesForWorkflows(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
+		const pendingWork = [...knownRuns.entries()]
+			.filter(([, run]) => !run.terminal)
+			.map(([runId]) => ({ kind: "workflow", runId }));
+		emit({
+			type: "agent_settled",
+			owner: activeOwner,
+			foreignInputSeen: foreignSinceLastSettle,
+			text: lastTextForOwner,
+			...extra,
+			...(pendingWork.length > 0 ? { provisional: true, pendingWork } : {}),
+		});
+		ensureWorkflowTimer(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
+		activeOwner = null;
+		interruptTurnOwner = null;
+		// An interrupt binding that never claimed a turn is stale once the session
+		// settles; leaving it set would misattribute the next unrelated turn. The
+		// same goes for a preempted owner whose aborted settle never arrived.
+		interruptPending = null;
+		preemptedOwner = null;
+		foreignSinceLastSettle = false;
+		lastTextForOwner = null;
+	};
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		sweepPendingState();
@@ -1078,28 +1160,7 @@ export default function (pi: ExtensionAPI) {
 			lastTextForOwner = null;
 			return;
 		}
-		agentRunning = false;
-		writeHeartbeat();
-		scanEntriesForWorkflows(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
-		const pendingWork = [...knownRuns.entries()]
-			.filter(([, run]) => !run.terminal)
-			.map(([runId]) => ({ kind: "workflow", runId }));
-		emit({
-			type: "agent_settled",
-			owner: activeOwner,
-			foreignInputSeen: foreignSinceLastSettle,
-			text: lastTextForOwner,
-			...(pendingWork.length > 0 ? { provisional: true, pendingWork } : {}),
-		});
-		ensureWorkflowTimer(ctx as { sessionManager?: { getEntries?: () => unknown[] } });
-		activeOwner = null;
-		// An interrupt binding that never claimed a turn is stale once the session
-		// settles; leaving it set would misattribute the next unrelated turn. The
-		// same goes for a preempted owner whose aborted settle never arrived.
-		interruptPending = null;
-		preemptedOwner = null;
-		foreignSinceLastSettle = false;
-		lastTextForOwner = null;
+		settleActive(ctx);
 	});
 
 	// --- Workflow launches (roadmap #3) --------------------------------------
