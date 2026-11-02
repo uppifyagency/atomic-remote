@@ -46,8 +46,6 @@ async function boot(t, { piOptions = {}, ctxOptions = {}, cwd } = {}) {
 	};
 }
 
-// A user-visible run start as Atomic delivers it: the run.start transcript
-// entry (workflow name) plus the typed hook (state).
 async function startRun(world, ctx, sessionId, runId, workflowName, entryId) {
 	ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: entryId, data: { runId, name: workflowName } });
 	await world.fire("workflow_lifecycle", makeWorkflowEvents(sessionId).run(runId, "running"), ctx);

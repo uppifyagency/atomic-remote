@@ -219,8 +219,6 @@ function makeOutboxReader(outbox) {
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const RUN_ID_PREFIX_PATTERN = /^[0-9a-f]{8}$/i;
 
-// Every run id the bridge has told us about: in-flight runs persisted in
-// meta.json plus any run named by outbox history (rotated generation too).
 function knownRunIds(target) {
 	const ids = new Set();
 	const add = (value) => {
@@ -247,8 +245,6 @@ function knownRunIds(target) {
 	return ids;
 }
 
-// Atomic accepts a unique 8-hex run-id prefix; so does the controller, resolved
-// against the runs this session's bridge has reported.
 function resolveRunId(target, token) {
 	if (RUN_ID_PATTERN.test(token)) return token.toLowerCase();
 	const prefix = token.toLowerCase();
@@ -345,8 +341,6 @@ function awaitingHint(target, runIds) {
 	return `\nRun(s) awaiting human input: ${ids}${questions}\nUnblock with: answer ${String(target.id).slice(0, 8)} <runId> "<answer>" (use an option label verbatim)`;
 }
 
-// Atomic keeps the question text out of its workflow hooks: statusFile is
-// the only zero-token place to read it from.
 function awaitingMessage(target, runId, wait) {
 	const question = awaitingInputRuns(target, [runId])[0]?.question;
 	const options = question?.options?.length ? ` [${question.options.map((o) => JSON.stringify(o)).join(" | ")}]` : "";
@@ -413,8 +407,6 @@ function createOutcomeTracker(payload, flags) {
 		workflowName: null,
 		myRuns: new Set(),
 		runDetail: new Map(), // runId -> last workflow_lifecycle record
-		// runId -> open waits (key -> awaiting record), for every run: a wait can
-		// open before a provisional settle adopts its run.
 		waits: new Map(),
 		resolved: null, // { text }
 		failure: null, // { state, code, message, runId?, failedStageId? }
@@ -431,8 +423,6 @@ function createOutcomeTracker(payload, flags) {
 		if (wait) out.push({ op: "awaiting", code: 8, runId, wait });
 	};
 
-	// Directives for a live loop: {op:"note"|"resolve"|"fail"|"awaiting", ...}.
-	// A post-hoc replay ignores them and reads snapshot() instead.
 	function apply(record) {
 		const out = [];
 		switch (record.type) {

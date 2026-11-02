@@ -109,8 +109,6 @@ test("run_workflow: installs the TS, reloads, runs, and binds to the run injecti
 			["/workflow demo-flow target=main", true],
 		],
 	);
-	// A handled slash command emits no input event; attribution binds via the
-	// run's typed first sight, checked against its workflow.run.start name.
 	const runId = "12121212-abcd-4ef0-9876-343434345656";
 	b.ctx.entries.push({ type: "custom", customType: "workflow.run.start", id: "e-p3", data: { runId, name: "demo-flow" } });
 	await b.hook(b.ev.run(runId, "running"));

@@ -15,9 +15,6 @@ import {
 	untilOutbox,
 } from "./helpers.mjs";
 
-// 0.9.64 contracts: workflow state comes from Atomic's typed workflow hooks
-// (workflow_lifecycle / workflow_heartbeat), not from polling session entries.
-
 process.env.ATOMIC_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-remote-0964-test-"));
 process.env.ATOMIC_REMOTE_RELOAD_SETTLE_MS = "50";
 const bridgeRoot = path.join(process.env.ATOMIC_CODING_AGENT_DIR, "remote-bridge");
@@ -255,8 +252,6 @@ test("reload: a fresh instance keeps in-flight runs and drops runs that ended wh
 	assert.deepEqual((await b.status("st-r1")).pendingWorkflows.sort(), [alive, ended].sort());
 
 	await b.world.fire("session_shutdown", { reason: "reload" });
-	// The run finished during the reload gap: Atomic never re-delivers its
-	// lifecycle to the new instance, but its run.end entry is in the transcript.
 	b.ctx.entries.push({ type: "custom", customType: "workflow.run.end", id: "e-gap", data: { runId: ended, status: "completed" } });
 	const world2 = makeFakePi();
 	registerBridge(world2.pi);
@@ -266,8 +261,6 @@ test("reload: a fresh instance keeps in-flight runs and drops runs that ended wh
 	await world2.fire("workflow_lifecycle", b.ev.run(alive, "completed", "running"), b.ctx);
 	assert.deepEqual((await b.status("st-r3")).pendingWorkflows, []);
 });
-
-// --- human-input waits: workflow_awaiting_input / workflow_input_resolved ------
 
 test("probe replay: each stage question opens a wait and each answer resolves it", async (t) => {
 	const b = await boot(t);
@@ -404,8 +397,6 @@ test("outcome: a detached run that is waiting for a human reports awaiting_input
 	assert.equal(outcome.exitCode, 8);
 	assert.equal(outcome.runs[0].awaitingInput, true);
 });
-
-// --- answer: unique 8-hex run-id prefix ------------------------------------------
 
 test("answer: a unique 8-hex prefix resolves to the full run id the bridge knows", async () => {
 	const agentDir = makeAgentDir();

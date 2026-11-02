@@ -99,9 +99,8 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WORKFLOW_NAME_PATTERN = /^[a-z0-9-]{1,64}$/;
 // Controller filenames are <ts:14>-<seq:3>-<id>.json; anything else yields id=null.
 const PROCESSING_ID_PATTERN = /^\d{14}-\d{3}-([A-Za-z0-9_-]{1,64})\.json\.processing$/;
-// A run is terminal for a controller once its status can no longer progress on
-// its own. A quit request counts too: it ends in "paused" (resumable), which
-// alone must not end a wait, so the request itself is the terminal signal.
+// A quit request ends in "paused" (resumable), which alone must not end a wait,
+// so the request itself is the terminal signal.
 const WORKFLOW_TERMINAL_STATUSES: readonly string[] = ["completed", "failed", "blocked", "cancelled", "killed", "skipped"];
 const SEEN_EVENT_CAP = 1024;
 
@@ -113,9 +112,6 @@ type BridgeCommand =
 	| { action: MessageAction; id: string; message: string; plan?: Record<string, unknown> }
 	| { action: "run_workflow"; id: string; workflowName: string; workflowSource: string; args?: string };
 
-// Structural copies of Atomic's typed workflow hooks
-// (coding-agent/src/core/extensions/workflow-events.ts), narrowed to what the
-// bridge reads. Tool targets are deliberately ignored: one per ctx.tool call.
 type WorkflowLifecycleTarget =
 	| { kind: "run"; runId: string; previousStatus?: string; status: string; action?: string }
 	| { kind: "stage"; runId: string; stageId: string; stageName: string; previousStatus?: string; status: string }
@@ -139,15 +135,11 @@ interface WorkflowHeartbeatEvent {
 	intervalMinutes?: number;
 }
 
-// One root run as the controller sees it: nested child runs fold into their
-// root, because the root id is what the workflow tool returns and what a
-// controller waits on.
 interface RunState {
 	owner: string | null;
 	terminal: boolean;
 	workflowName: string | null;
 	stages: Map<string, { name: string; status: string }>;
-	// Open human-input waits, keyed by stage id or "prompt:<promptId>".
 	waits: Map<string, { stageId: string | null; stageName: string | null }>;
 }
 
@@ -358,10 +350,8 @@ export default function (pi: ExtensionAPI) {
 		interruptSettleTimer = undefined;
 	};
 
-	// Workflow tracking (roadmap #3), keyed by root run id.
 	const knownRuns = new Map<string, RunState>();
-	// Session whose workflows this instance mirrors: hooks fire for every run
-	// the workflows extension publishes, and only the owner's belong here.
+	// Atomic fires these hooks for every run it publishes, not only this session's.
 	let ownSessionId: string | null = null;
 	const seenEventIds = new Set<string>();
 	// A slash-launched run never passes through the model's workflow tool (no
@@ -500,7 +490,7 @@ export default function (pi: ExtensionAPI) {
 			const entry = entries[i] as { type?: string; customType?: string; data?: Record<string, unknown> } | null;
 			if (entry?.type !== "custom" || String(entry.data?.runId ?? "").toLowerCase() !== runId) continue;
 			if (entry.customType === "workflow.run.start") {
-				found.ended ??= false; // a resumed run reuses its id: the latest of start/end wins
+				found.ended ??= false; // a resumed run reuses its id
 				if (typeof entry.data?.name === "string") found.name ??= entry.data.name;
 			} else if (entry.customType === "workflow.run.end") {
 				found.ended ??= true;
@@ -525,8 +515,6 @@ export default function (pi: ExtensionAPI) {
 	const firstSight = (runId: string, attribution: string | undefined, ctx: SessionCtx): RunState => {
 		const run: RunState = { owner: null, terminal: false, workflowName: runEntries(ctx, runId).name ?? null, stages: new Map(), waits: new Map() };
 		const launch = pendingWorkflowLaunch;
-		// Agent launches belong to the workflow tool's result (tool_execution_end);
-		// scheduler and recovery starts were launched by nobody remote.
 		const launchable = attribution === undefined || attribution === "user" || attribution === "unknown";
 		if (launch !== null && launchable && (run.workflowName ?? launch.workflowName) === launch.workflowName) {
 			run.owner = launch.owner;
@@ -558,8 +546,7 @@ export default function (pi: ExtensionAPI) {
 		sweepPendingState();
 		const runId = lifecycle.rootRunId.toLowerCase();
 		const run = knownRuns.get(runId) ?? firstSight(runId, lifecycle.attribution, ctx as SessionCtx);
-		// No question text travels with these: Atomic keeps it out of the hooks
-		// (and out of the transcript); the controller reads it from statusFile.
+		// Atomic keeps the question text out of these hooks; it lives only in statusFile.
 		const setWait = (key: string, open: boolean, stageId: string | null, stageName: string | null) => {
 			if (open === run.waits.has(key)) return;
 			if (open) run.waits.set(key, { stageId, stageName });
@@ -585,7 +572,6 @@ export default function (pi: ExtensionAPI) {
 			setWait(target.stageId, target.status === "awaiting_input", target.stageId, target.stageName);
 			return;
 		}
-		// A nested run's own status is internal to its root: only its stages surface.
 		if (lifecycle.runId.toLowerCase() !== runId) return;
 		const kind = runKind(target);
 		const terminal = WORKFLOW_TERMINAL_STATUSES.includes(target.status) || target.action === "quit";
@@ -609,9 +595,6 @@ export default function (pi: ExtensionAPI) {
 		if (run.terminal !== wasTerminal) persistPendingRuns();
 	});
 
-	// Atomic schedules these at most once per heartbeatIntervalMinutes (15 min
-	// default) per run: low-cardinality, and they feed the controller's idle
-	// timeout during long silent runs.
 	pi.on("workflow_heartbeat", async (event) => {
 		const heartbeat = event as unknown as WorkflowHeartbeatEvent;
 		if (!outboxPath) return;
@@ -992,9 +975,6 @@ export default function (pi: ExtensionAPI) {
 		outboxModeApplied = false;
 		fs.mkdirSync(path.join(inboxDir, ".tmp"), { recursive: true, mode: 0o700 });
 		ownSessionId = sessionId;
-		// Rebuild the in-flight runs a previous instance of this same session
-		// was tracking (reload / engine replacement). A run that ended in the gap
-		// gets no hook for this instance, so its run.end entry retires it.
 		const persisted = readMeta()?.pendingRuns;
 		if (Array.isArray(persisted)) {
 			for (const item of persisted) {
